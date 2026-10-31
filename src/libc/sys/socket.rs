@@ -20,7 +20,7 @@
 //! Useful resources:
 //! - [Beej's Guide to Network Programming](https://beej.us/guide/bgnet/html/index-wide.html)
 
-use crate::dyld::{export_c_func, FunctionExports};
+use crate::dyld::{export_c_func, export_c_func_aliased, FunctionExports};
 use crate::libc::errno::{
     get_errno, set_errno, EACCES, EADDRINUSE, EADDRNOTAVAIL, EAFNOSUPPORT, EAGAIN, EBADF,
     ECONNABORTED, ECONNREFUSED, ECONNRESET, EFAULT, EINVAL, EIO, EISCONN, ENETUNREACH,
@@ -44,6 +44,20 @@ use std::io::{Read, Write};
 use std::net::{
     Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6, TcpListener, TcpStream, UdpSocket,
 };
+
+/// HYPER-DBG: limited diagnostic logging, so the log file does not get flooded.
+static HYPER_DBG_GENERAL: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+static HYPER_DBG_POLL: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+static HYPER_DBG_RECV: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+fn hyper_dbg_ok() -> bool {
+    HYPER_DBG_GENERAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 300
+}
+fn hyper_dbg_poll_ok() -> bool {
+    HYPER_DBG_POLL.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 80
+}
+fn hyper_dbg_recv_ok() -> bool {
+    HYPER_DBG_RECV.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 80
+}
 
 pub const AF_INET: i32 = 2;
 pub const AF_INET6: i32 = 30;
@@ -258,6 +272,15 @@ fn socket(env: &mut Environment, domain: i32, type_: i32, protocol: i32) -> File
     State::get_mut(env).sockets.insert(fd, host_object);
 
     log_dbg!("socket({}, {}, {}) => {}", domain, type_, protocol, fd);
+    if hyper_dbg_ok() {
+        log!(
+            "HYPER-DBG socket(domain={}, type={}, proto={}) => fd {}",
+            domain,
+            type_,
+            protocol,
+            fd
+        );
+    }
     fd
 }
 
@@ -836,6 +859,9 @@ fn connect(
     address_len: socklen_t,
 ) -> i32 {
     set_errno(env, 0);
+    if hyper_dbg_ok() {
+        log!("HYPER-DBG connect(fd={}, addr_len={})", socket, address_len);
+    }
     let Some(sock) = State::get(env).sockets.get(&socket) else {
         set_errno(env, EBADF);
         return -1;
@@ -930,6 +956,15 @@ fn select(
     // out-of-range n_fds is invalid guest input. Report EINVAL instead of
     // panicking on the assert.
     set_errno(env, 0);
+    if hyper_dbg_poll_ok() {
+        log!(
+            "HYPER-DBG select(n_fds={}, has_read={}, has_write={}, has_timeout={})",
+            n_fds,
+            !read_fds.is_null(),
+            !write_fds.is_null(),
+            !timeout.is_null()
+        );
+    }
     if !(0..=1024).contains(&n_fds) {
         log!("select: invalid n_fds {}, returning EINVAL", n_fds);
         set_errno(env, EINVAL);
@@ -1573,6 +1608,14 @@ fn recvfrom(
     // errno is set on every failure path below.
     set_errno(env, 0);
 
+    if hyper_dbg_recv_ok() {
+        log!(
+            "HYPER-DBG recvfrom(fd={}, len={}, flags={})",
+            socket,
+            length,
+            flags
+        );
+    }
     log_dbg!(
         "recvfrom({}, {:?}, {}, {}, {:?}, {:?})",
         socket,
@@ -1675,6 +1718,14 @@ fn send(
     flags: i32,
 ) -> i32 {
     set_errno(env, 0);
+    if hyper_dbg_ok() {
+        log!(
+            "HYPER-DBG send(fd={}, len={}, flags={})",
+            socket,
+            length,
+            flags
+        );
+    }
     let Some(sock) = State::get(env).sockets.get(&socket) else {
         set_errno(env, EBADF);
         return -1;
@@ -2216,7 +2267,112 @@ pub(crate) fn socket_poll_events(
     if hangup {
         ready |= POLLHUP;
     }
+    if type_ == SOCK_STREAM && has_stream && hyper_dbg_poll_ok() {
+        log!(
+            "HYPER-DBG poll(fd={}, events={:#x}) => {:#x}",
+            fd,
+            events,
+            ready
+        );
+    }
     ready
+}
+
+/// Creates a connected pair of host loopback TCP streams, both non-blocking.
+fn host_loopback_pair() -> io::Result<(TcpStream, TcpStream)> {
+    let listener = TcpListener::bind("127.0.0.1:0")?;
+    let address = listener.local_addr()?;
+    let first = TcpStream::connect(address)?;
+    let (second, _) = listener.accept()?;
+    first.set_nonblocking(true)?;
+    second.set_nonblocking(true)?;
+    Ok((first, second))
+}
+
+/// `socketpair(2)`. Apps commonly use it to wake up a thread that is waiting
+/// in `select()`/`poll()`. Only `SOCK_STREAM` is supported: the pair is built
+/// from two connected loopback TCP streams on the host.
+fn socketpair(
+    env: &mut Environment,
+    domain: i32,
+    type_: i32,
+    protocol: i32,
+    sv: MutPtr<i32>,
+) -> i32 {
+    set_errno(env, 0);
+    if hyper_dbg_ok() {
+        log!(
+            "HYPER-DBG socketpair(domain={}, type={}, proto={})",
+            domain,
+            type_,
+            protocol
+        );
+    }
+    if sv.is_null() {
+        set_errno(env, EFAULT);
+        return -1;
+    }
+    if type_ != SOCK_STREAM {
+        log!(
+            "socketpair: unsupported socket type {} (only SOCK_STREAM), returning ESOCKTNOSUPPORT",
+            type_
+        );
+        set_errno(env, ESOCKTNOSUPPORT);
+        return -1;
+    }
+    let (first, second) = match host_loopback_pair() {
+        Ok(pair) => pair,
+        Err(e) => {
+            log!("socketpair: could not create host loopback pair: {}", e);
+            set_errno(env, EIO);
+            return -1;
+        }
+    };
+
+    let fd_first = find_or_create_socket(env);
+    State::get_mut(env).sockets.insert(
+        fd_first,
+        SocketHostObject {
+            type_: SOCK_STREAM,
+            options: Default::default(),
+            tcp_listener: None,
+            pending_tcp_stream: None,
+            tcp_stream: Some(first),
+            udp_socket: None,
+            domain: AF_INET,
+            offline_address: None,
+        },
+    );
+    let fd_second = find_or_create_socket(env);
+    State::get_mut(env).sockets.insert(
+        fd_second,
+        SocketHostObject {
+            type_: SOCK_STREAM,
+            options: Default::default(),
+            tcp_listener: None,
+            pending_tcp_stream: None,
+            tcp_stream: Some(second),
+            udp_socket: None,
+            domain: AF_INET,
+            offline_address: None,
+        },
+    );
+
+    let mut bytes: Vec<u8> = Vec::with_capacity(8);
+    bytes.extend_from_slice(&fd_first.to_le_bytes());
+    bytes.extend_from_slice(&fd_second.to_le_bytes());
+    env.mem
+        .bytes_at_mut(sv.cast::<u8>(), 8)
+        .copy_from_slice(&bytes);
+
+    if hyper_dbg_ok() {
+        log!(
+            "HYPER-DBG socketpair => fds {} and {}",
+            fd_first,
+            fd_second
+        );
+    }
+    0
 }
 
 pub const FUNCTIONS: FunctionExports = &[
@@ -2228,6 +2384,8 @@ pub const FUNCTIONS: FunctionExports = &[
     export_c_func!(listen(_, _)),
     export_c_func!(connect(_, _, _)),
     export_c_func!(select(_, _, _, _, _)),
+    export_c_func_aliased!("select$DARWIN_EXTSN", select(_, _, _, _, _)),
+    export_c_func!(socketpair(_, _, _, _)),
     export_c_func!(accept(_, _, _)),
     export_c_func!(recv(_, _, _, _)),
     export_c_func!(recvfrom(_, _, _, _, _, _)),
@@ -2240,6 +2398,9 @@ pub const FUNCTIONS: FunctionExports = &[
 
 /// A helper to close a socket, not a part of API
 pub fn close_socket(env: &mut Environment, socket: i32) -> bool {
+    if hyper_dbg_ok() {
+        log!("HYPER-DBG close_socket(fd={})", socket);
+    }
     // True when the socket existed and was removed (the old is_none()
     // check had the sense inverted).
     State::get_mut(env).sockets.remove(&socket).is_some()
