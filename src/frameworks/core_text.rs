@@ -853,6 +853,7 @@ fn CTFontDrawGlyphs(
 
     if ct_trace() {
         let ctm = CGContextGetCTM(env, context);
+        let (ctm_a, ctm_d, ctm_tx, ctm_ty) = (ctm.a, ctm.d, ctm.tx, ctm.ty);
         let width = crate::frameworks::core_graphics::cg_bitmap_context::CGBitmapContextGetWidth(env, context);
         let height = CGBitmapContextGetHeight(env, context);
         log!(
@@ -863,10 +864,10 @@ fn CTFontDrawGlyphs(
             glyph_positions.last(),
             width,
             height,
-            ctm.a,
-            ctm.d,
-            ctm.tx,
-            ctm.ty
+            ctm_a,
+            ctm_d,
+            ctm_tx,
+            ctm_ty
         );
     }
     let mut drawer = CGBitmapContextDrawer::new(&env.objc, &mut env.mem, context);
@@ -1291,7 +1292,8 @@ fn CTFramesetterSuggestFrameSizeWithConstraints(
     fit_range: MutPtr<CFRange>,
 ) -> CGSize {
     if ct_trace() {
-        log!("CT trace: CTFramesetterSuggestFrameSizeWithConstraints constraints {}x{}", constraints.width, constraints.height);
+        let (constraint_w, constraint_h) = (constraints.width, constraints.height);
+        log!("CT trace: CTFramesetterSuggestFrameSizeWithConstraints constraints {}x{}", constraint_w, constraint_h);
     }
     if framesetter.is_null() {
         if !fit_range.is_null() {
@@ -2190,4 +2192,4 @@ mod tests {
         assert_eq!(system_font_file("Courier New", "Bold Italic"), "LiberationMono-BoldItalic.ttf");
         assert_eq!(system_font_file("", ""), "LiberationSans-Regular.ttf");
     }
-    }
+        }
