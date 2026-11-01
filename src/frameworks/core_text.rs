@@ -1464,6 +1464,307 @@ fn CTParagraphStyleGetValueForSpecifier(
     false
 }
 
+// =========================================================================
+// MARK: - HYPER: font names, traits, descriptors, line/run helpers
+// (functions that Brawl Stars 2.57 imports but were not implemented)
+// =========================================================================
+
+/// Reads a name record (1 = family, 2 = subfamily, 4 = full name,
+/// 6 = PostScript name) out of a TrueType/OpenType `name` table.
+fn name_from_name_table(data: &[u8], name_id: u16) -> Option<String> {
+    if data.len() < 6 {
+        return None;
+    }
+    let count = u16::from_be_bytes([data[2], data[3]]) as usize;
+    let string_offset = u16::from_be_bytes([data[4], data[5]]) as usize;
+    for i in 0..count {
+        let record_offset = 6 + i * 12;
+        if data.len() < record_offset + 12 {
+            break;
+        }
+        let platform_id = u16::from_be_bytes([data[record_offset], data[record_offset + 1]]);
+        let encoding_id = u16::from_be_bytes([data[record_offset + 2], data[record_offset + 3]]);
+        let nid = u16::from_be_bytes([data[record_offset + 6], data[record_offset + 7]]);
+        let length =
+            u16::from_be_bytes([data[record_offset + 8], data[record_offset + 9]]) as usize;
+        let offset =
+            u16::from_be_bytes([data[record_offset + 10], data[record_offset + 11]]) as usize;
+        if nid != name_id {
+            continue;
+        }
+        let str_start = string_offset + offset;
+        if str_start + length > data.len() {
+            continue;
+        }
+        let raw = &data[str_start..str_start + length];
+        if (platform_id == 3 && encoding_id == 1) || platform_id == 0 {
+            let chars: Vec<u16> = raw
+                .chunks_exact(2)
+                .map(|c| u16::from_be_bytes([c[0], c[1]]))
+                .collect();
+            return String::from_utf16(&chars).ok();
+        }
+        if platform_id == 1 && encoding_id == 0 {
+            return Some(String::from_utf8_lossy(raw).into_owned());
+        }
+    }
+    None
+}
+
+/// Returns a retained NSString with the requested name of a CTFont, or nil.
+/// Fonts loaded from app files (custom fonts) are asked for the record in
+/// their own `name` table; any other font falls back to its PostScript name.
+fn ct_font_name_string(env: &mut Environment, font: CTFontRef, name_id: u16) -> id {
+    if font.is_null() {
+        return nil;
+    }
+    let ui_font = env.objc.borrow::<CTFontHostObject>(font).font;
+    if ui_font == nil {
+        return nil;
+    }
+    if let Some(custom) = custom_font_of_uifont(env, ui_font) {
+        if let Some(data) = custom.table_data(0x6E616D65 /* 'name' */) {
+            if let Some(name) = name_from_name_table(&data, name_id) {
+                return from_rust_string(env, name);
+            }
+        }
+    }
+    let name: id = msg![env; ui_font fontName];
+    if name == nil {
+        nil
+    } else {
+        msg![env; name copy]
+    }
+}
+
+/// `CFStringRef CTFontCopyFamilyName(CTFontRef font)`
+fn CTFontCopyFamilyName(env: &mut Environment, font: CTFontRef) -> id {
+    ct_font_name_string(env, font, 1)
+}
+
+/// `CFStringRef CTFontCopyFullName(CTFontRef font)`
+fn CTFontCopyFullName(env: &mut Environment, font: CTFontRef) -> id {
+    ct_font_name_string(env, font, 4)
+}
+
+/// `CTFontSymbolicTraits CTFontGetSymbolicTraits(CTFontRef font)`
+///
+/// We do not track bold/italic flags, so report "no special traits".
+fn CTFontGetSymbolicTraits(_env: &mut Environment, _font: CTFontRef) -> u32 {
+    0
+}
+
+/// `CTFontDescriptorRef CTFontCopyFontDescriptor(CTFontRef font)`
+///
+/// Builds a descriptor that carries the font's PostScript name.
+fn CTFontCopyFontDescriptor(env: &mut Environment, font: CTFontRef) -> CTFontDescriptorRef {
+    if font.is_null() {
+        return nil;
+    }
+    let attrs: id = msg_class![env; NSMutableDictionary dictionary];
+    let name = CTFontCopyPostScriptName(env, font);
+    if name != nil {
+        let key = get_static_str(env, "NSFontNameAttribute");
+        () = msg![env; attrs setObject:name forKey:key];
+        release(env, name);
+    }
+    retain(env, attrs);
+    alloc_descriptor(env, attrs)
+}
+
+/// `CTFontDescriptorRef CTFontDescriptorCreateCopyWithAttributes(
+///     CTFontDescriptorRef original, CFDictionaryRef attributes)`
+fn CTFontDescriptorCreateCopyWithAttributes(
+    env: &mut Environment,
+    descriptor: CTFontDescriptorRef,
+    attributes: id,
+) -> CTFontDescriptorRef {
+    let merged: id = msg_class![env; NSMutableDictionary dictionary];
+    if !descriptor.is_null() {
+        let old = descriptor_attrs(env, descriptor);
+        if old != nil {
+            () = msg![env; merged addEntriesFromDictionary:old];
+        }
+    }
+    if attributes != nil {
+        () = msg![env; merged addEntriesFromDictionary:attributes];
+    }
+    retain(env, merged);
+    alloc_descriptor(env, merged)
+}
+
+/// `CFRange CTLineGetStringRange(CTLineRef line)`
+fn CTLineGetStringRange(env: &mut Environment, line: CTLineRef) -> CFRange {
+    let length = if line.is_null() {
+        0
+    } else {
+        CTLineGetGlyphCount(env, line)
+    };
+    CFRange {
+        location: 0,
+        length,
+    }
+}
+
+/// Horizontal offset of the glyph at `char_index` (sum of the advances of
+/// all glyphs before it). One glyph per UTF-16 unit, as in the other
+/// line/run functions here.
+fn ct_line_offset(env: &mut Environment, line: CTLineRef, char_index: CFIndex) -> CGFloat {
+    if line.is_null() || char_index <= 0 {
+        return 0.0;
+    }
+    let (text, ui_font) = {
+        let host = env.objc.borrow::<CTLineHostObject>(line);
+        (host.text, host.font)
+    };
+    if text == nil || ui_font == nil {
+        return 0.0;
+    }
+    let count = CTLineGetGlyphCount(env, line);
+    let text_str = to_rust_string(env, text).into_owned();
+    let font = font_for_text(env, ui_font, &text_str).unwrap_or_else(Font::sans_regular);
+    let size: CGFloat = msg![env; ui_font pointSize];
+    let upto = char_index.min(count).max(0) as u32;
+    let mut width = 0.0f64;
+    for text_index in 0..upto {
+        let character: unichar = msg![env; text characterAtIndex:(text_index as NSUInteger)];
+        let glyph = GlyphId(glyph_for_code_unit(&font, character));
+        width += font.glyph_advance_at_size(glyph, size) as f64;
+    }
+    width as CGFloat
+}
+
+/// `CGFloat CTLineGetOffsetForStringIndex(CTLineRef line, CFIndex charIndex,
+///     CGFloat *secondaryOffset)`
+fn CTLineGetOffsetForStringIndex(
+    env: &mut Environment,
+    line: CTLineRef,
+    char_index: CFIndex,
+    secondary_offset: MutPtr<CGFloat>,
+) -> CGFloat {
+    let offset = ct_line_offset(env, line, char_index);
+    if !secondary_offset.is_null() {
+        env.mem.write(secondary_offset, offset);
+    }
+    offset
+}
+
+/// `void CTRunGetAdvances(CTRunRef run, CFRange range, CGSize buffer[])`
+fn CTRunGetAdvances(env: &mut Environment, run: CTRunRef, range: CFRange, buffer: MutPtr<CGSize>) {
+    if run.is_null() || buffer.is_null() {
+        return;
+    }
+    let (text, ui_font) = {
+        let host = env.objc.borrow::<CTLineHostObject>(run);
+        (host.text, host.font)
+    };
+    if text == nil || ui_font == nil {
+        return;
+    }
+    let count = CTLineGetGlyphCount(env, run);
+    let Some((start, end)) = glyph_range_for_run(range, count) else {
+        return;
+    };
+    let text_str = to_rust_string(env, text).into_owned();
+    let font = font_for_text(env, ui_font, &text_str).unwrap_or_else(Font::sans_regular);
+    let size: CGFloat = msg![env; ui_font pointSize];
+    for text_index in start..end {
+        let character: unichar = msg![env; text characterAtIndex:(text_index as NSUInteger)];
+        let glyph = GlyphId(glyph_for_code_unit(&font, character));
+        let advance = font.glyph_advance_at_size(glyph, size);
+        env.mem.write(
+            buffer + (text_index - start),
+            CGSize {
+                width: advance as CGFloat,
+                height: 0.0,
+            },
+        );
+    }
+}
+
+/// `CTRunStatus CTRunGetStatus(CTRunRef run)`: no special status flags.
+fn CTRunGetStatus(_env: &mut Environment, _run: CTRunRef) -> u32 {
+    0
+}
+
+/// `void CTRunGetStringIndices(CTRunRef run, CFRange range, CFIndex buffer[])`
+///
+/// One glyph per UTF-16 unit, so glyph index == string index.
+fn CTRunGetStringIndices(
+    env: &mut Environment,
+    run: CTRunRef,
+    range: CFRange,
+    buffer: MutPtr<CFIndex>,
+) {
+    if run.is_null() || buffer.is_null() {
+        return;
+    }
+    let count = CTLineGetGlyphCount(env, run);
+    let Some((start, end)) = glyph_range_for_run(range, count) else {
+        return;
+    };
+    for text_index in start..end {
+        env.mem
+            .write(buffer + (text_index - start), text_index as CFIndex);
+    }
+}
+
+/// `CFIndex CTTypesetterSuggestLineBreak(CTTypesetterRef typesetter,
+///     CFIndex startIndex, double width)`
+///
+/// Returns how many UTF-16 units starting at `startIndex` fit into `width`,
+/// preferring to break after a space and always after a newline.
+fn CTTypesetterSuggestLineBreak(
+    env: &mut Environment,
+    typesetter: CTTypesetterRef,
+    start_index: CFIndex,
+    width: f64,
+) -> CFIndex {
+    if typesetter.is_null() {
+        return 0;
+    }
+    let attr_string = env
+        .objc
+        .borrow::<CTTypesetterHostObject>(typesetter)
+        .attr_string;
+    let (text, ui_font, _attributes) = string_and_font_from_attr_string(env, attr_string);
+    if text == nil || ui_font == nil {
+        return 0;
+    }
+    let total_units: NSUInteger = msg![env; text length];
+    let total = total_units as CFIndex;
+    let start = start_index.max(0);
+    if start >= total {
+        return 0;
+    }
+    let text_str = to_rust_string(env, text).into_owned();
+    let font = font_for_text(env, ui_font, &text_str).unwrap_or_else(Font::sans_regular);
+    let size: CGFloat = msg![env; ui_font pointSize];
+    let mut used = 0.0f64;
+    let mut last_break: Option<CFIndex> = None;
+    let mut index = start;
+    while index < total {
+        let character: unichar = msg![env; text characterAtIndex:(index as NSUInteger)];
+        let advance = font.glyph_advance_at_size(GlyphId(glyph_for_code_unit(&font, character)), size)
+            as f64;
+        if character == 0x0A {
+            return index + 1 - start;
+        }
+        if used + advance > width && index > start {
+            return match last_break {
+                Some(break_index) if break_index > start => break_index - start,
+                _ => index - start,
+            };
+        }
+        used += advance;
+        if character == 0x20 {
+            last_break = Some(index + 1);
+        }
+        index += 1;
+    }
+    total - start
+}
+
 pub const FUNCTIONS: FunctionExports = &[
     export_c_func!(CTFontCreateWithGraphicsFont(_, _, _, _)),
     export_c_func!(CTFontCreateWithName(_, _, _)),
@@ -1508,6 +1809,17 @@ pub const FUNCTIONS: FunctionExports = &[
     export_c_func!(CTFrameGetStringRange(_)),
     export_c_func!(CTFrameGetVisibleStringRange(_)),
     export_c_func!(CTFrameDraw(_, _)),
+    export_c_func!(CTFontCopyFamilyName(_)),
+    export_c_func!(CTFontCopyFullName(_)),
+    export_c_func!(CTFontGetSymbolicTraits(_)),
+    export_c_func!(CTFontCopyFontDescriptor(_)),
+    export_c_func!(CTFontDescriptorCreateCopyWithAttributes(_, _)),
+    export_c_func!(CTLineGetStringRange(_)),
+    export_c_func!(CTLineGetOffsetForStringIndex(_, _, _)),
+    export_c_func!(CTRunGetAdvances(_, _, _)),
+    export_c_func!(CTRunGetStatus(_)),
+    export_c_func!(CTRunGetStringIndices(_, _, _)),
+    export_c_func!(CTTypesetterSuggestLineBreak(_, _, _)),
 ];
 
 pub const CONSTANTS: ConstantExports = &[
