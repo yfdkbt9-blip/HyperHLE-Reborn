@@ -1071,6 +1071,15 @@ fn diag_buffer_cache() -> &'static std::sync::Mutex<HashMap<GLuint, Vec<u8>>> {
         std::sync::OnceLock::new();
     CACHE.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
 }
+/// glMapBufferRange fallback bookkeeping: for mappings that live only in a
+/// guest-memory mirror (the backend has no MapBufferRange), remember the byte
+/// offset the app mapped at, so glUnmapBuffer / glFlushMappedBufferRange can
+/// upload the mirror to the right place with glBufferSubData.
+fn map_range_offsets() -> &'static std::sync::Mutex<HashMap<(GLenum, GLuint), usize>> {
+    static OFFSETS: std::sync::OnceLock<std::sync::Mutex<HashMap<(GLenum, GLuint), usize>>> =
+        std::sync::OnceLock::new();
+    OFFSETS.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+}
 unsafe fn debug_log_buffer_upload(
     gles: &mut dyn GLES,
     mem: &Mem,
@@ -4228,11 +4237,22 @@ fn unmap_buffer(env: &mut Environment, target: GLenum, oes: bool) -> GLboolean {
             );
         },
         None => {
+            // Offset recorded by the glMapBufferRange fallback (0 for OES maps).
+            let map_offset = map_range_offsets()
+                .lock()
+                .unwrap()
+                .remove(&(target, buffer_object_name))
+                .unwrap_or(0);
             with_ctx_and_mem(env, |gles, mem| unsafe {
                 let data = mem
                     .bytes_at(guest_buffer.cast(), buffer_size as GuestUSize)
                     .as_ptr() as *const GLvoid;
-                gles.BufferSubData(target, 0, buffer_size as HostGLsizeiptr, data);
+                gles.BufferSubData(
+                    target,
+                    map_offset as HostGLintptr,
+                    buffer_size as HostGLsizeiptr,
+                    data,
+                );
             });
         }
     }
@@ -6766,47 +6786,23 @@ fn glMapBufferRange(
     length: GuestGLsizeiptr,
     access: GLbitfield,
 ) -> MutVoidPtr {
-    let host_ptr: *mut GLvoid = with_ctx_and_mem(env, |gles, _mem| unsafe {
-        gles.MapBufferRange(
-            target,
-            offset as HostGLintptr,
-            length as HostGLsizeiptr,
-            access,
-        )
-    });
-    // The host pointer cannot be observed by the guest directly. EAGL
-    // tracks pending mappings in `EAGLContextHostObject::mapped_buffers`;
-    // the matching `glUnmapBuffer` consults that table. Allocate a guest
-    // buffer of `length` bytes, copy the contents from the host pointer,
-    // and remember the pairing.
-    if host_ptr.is_null() || length == 0 {
+    let (Ok(offset_usize), Ok(length_usize)) = (usize::try_from(offset), usize::try_from(length))
+    else {
         log!(
-            "Warning: glMapBufferRange(target={:#x}, offset={}, length={}, access={:#x}) \
-             produced a NULL host pointer or zero length; returning NULL.",
+            "Warning: glMapBufferRange with negative offset {} or length {}; returning NULL.",
+            offset,
+            length
+        );
+        return Ptr::null();
+    };
+    if length_usize == 0 {
+        log!(
+            "Warning: glMapBufferRange(target={:#x}, offset={}, length=0, access={:#x}); returning NULL.",
             target,
             offset,
-            length,
             access
         );
         return Ptr::null();
-    }
-    let length_usize = match usize::try_from(length) {
-        Ok(size) => size,
-        Err(_) => {
-            log!(
-                "Warning: glMapBufferRange with negative/overflowing length {}; returning NULL.",
-                length
-            );
-            return Ptr::null();
-        }
-    };
-    let guest_buf: MutPtr<GLvoid> = env.mem.alloc(length_usize as GuestUSize).cast();
-    unsafe {
-        let host_slice = from_raw_parts(host_ptr as *const u8, length_usize);
-        let guest_slice = env
-            .mem
-            .bytes_at_mut(guest_buf.cast(), length_usize as GuestUSize);
-        guest_slice.copy_from_slice(host_slice);
     }
     let current_ctx: Option<crate::objc::id> = *env
         .framework_state
@@ -6818,17 +6814,56 @@ fn glMapBufferRange(
              returning NULL.",
             env.current_thread
         );
-        env.mem.free(guest_buf);
-        with_ctx_and_mem(env, |gles, _mem| unsafe {
-            gles.UnmapBuffer(target);
-        });
         return Ptr::null();
     };
+    // Ask the backend first. On backends that implement MapBufferRange this
+    // gives a real driver pointer. The ES 2.0 backend only has a stub that
+    // returns NULL; for that case we fall back to a guest-memory mirror.
+    let host_ptr: *mut GLvoid = with_ctx_and_mem(env, |gles, _mem| unsafe {
+        gles.MapBufferRange(
+            target,
+            offset as HostGLintptr,
+            length as HostGLsizeiptr,
+            access,
+        )
+    });
     let buffer_object_name = _get_currently_bound_buffer_object_name(env, target);
+    let guest_buf: MutPtr<GLvoid> = env.mem.alloc(length_usize as GuestUSize).cast();
+    let host_ptr_opt: Option<*mut GLvoid> = if host_ptr.is_null() {
+        // Fallback: the app writes into this guest block; glUnmapBuffer (or
+        // glFlushMappedBufferRange) uploads it with glBufferSubData at
+        // `offset_usize`. The backend cannot read buffers back, so the block
+        // starts zeroed (fine for the usual WRITE | INVALIDATE streaming use).
+        if access & 0x1 != 0 {
+            log!(
+                "Warning: glMapBufferRange(target={:#x}, access={:#x}) asks for \
+                 GL_MAP_READ_BIT but this backend cannot read buffers back; the \
+                 mapped block starts zeroed.",
+                target,
+                access
+            );
+        }
+        env.mem
+            .bytes_at_mut(guest_buf.cast(), length_usize as GuestUSize)
+            .fill(0);
+        map_range_offsets()
+            .lock()
+            .unwrap()
+            .insert((target, buffer_object_name), offset_usize);
+        None
+    } else {
+        unsafe {
+            let host_slice = from_raw_parts(host_ptr as *const u8, length_usize);
+            env.mem
+                .bytes_at_mut(guest_buf.cast(), length_usize as GuestUSize)
+                .copy_from_slice(host_slice);
+        }
+        Some(host_ptr)
+    };
     let host_obj = env.objc.borrow_mut::<EAGLContextHostObject>(ctx);
     if let Some((old_guest_buf, _, _)) = host_obj.mapped_buffers.insert(
         (target, buffer_object_name),
-        (guest_buf, Some(host_ptr), length_usize),
+        (guest_buf, host_ptr_opt, length_usize),
     ) {
         env.mem.free(old_guest_buf);
     }
@@ -6884,12 +6919,18 @@ fn glFlushMappedBufferRange(
                     // it means uploading the requested range. No driver-side
                     // mapping exists, so there is nothing to forward the flush
                     // to either.
+                    let map_offset = map_range_offsets()
+                        .lock()
+                        .unwrap()
+                        .get(&(target, buffer_object_name))
+                        .copied()
+                        .unwrap_or(0);
                     with_ctx_and_mem(env, |gles, mem| unsafe {
                         let data = mem.bytes_at(guest_buf.cast(), end as GuestUSize).as_ptr()
                             .add(offset_usize) as *const GLvoid;
                         gles.BufferSubData(
                             target,
-                            offset as HostGLintptr,
+                            (map_offset + offset_usize) as HostGLintptr,
                             length_usize as HostGLsizeiptr,
                             data,
                         );
@@ -9420,4 +9461,4 @@ mod performance_texture_size_tests {
         assert_eq!(texture_storage_level_bytes(0, 8, 0x8058), 0);
         assert_eq!(texture_storage_level_bytes(16, 8, 0x83F1), 0);
     }
-}
+                     }
