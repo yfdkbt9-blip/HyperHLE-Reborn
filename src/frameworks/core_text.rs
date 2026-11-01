@@ -997,12 +997,15 @@ fn CTFontDrawGlyphs(
         let is_clock_size = (size - 28.125 * em_fix(env, ui_font)).abs() < 0.2;
         if (is_clock_size && DRAW_LOGS.fetch_add(1, Ordering::Relaxed) < 300) || first_seen {
             let ctm = CGContextGetCTM(env, context);
+            // CGAffineTransform is packed: copy fields to locals before
+            // handing them to log!/format_args! (which takes references).
+            let (ctm_a, ctm_d, ctm_tx, ctm_ty) = (ctm.a, ctm.d, ctm.tx, ctm.ty);
             let cw = crate::frameworks::core_graphics::cg_bitmap_context::CGBitmapContextGetWidth(env, context);
             let ch = CGBitmapContextGetHeight(env, context);
+            let ids: Vec<_> = glyph_ids.iter().map(|g| g.0).collect();
             log!(
                 "CT diag: Draw glyphs {:?} size {} at {:?} ctx {}x{} ctm a={} d={} tx={} ty={}",
-                glyph_ids.iter().map(|g| g.0).collect::<Vec<_>>(),
-                size, glyph_positions, cw, ch, ctm.a, ctm.d, ctm.tx, ctm.ty
+                ids, size, glyph_positions, cw, ch, ctm_a, ctm_d, ctm_tx, ctm_ty
             );
         }
     }
