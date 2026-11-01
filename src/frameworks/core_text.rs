@@ -677,7 +677,7 @@ fn CTTypesetterCreateWithAttributedString(
 fn CTTypesetterCreateLine(
     env: &mut Environment,
     typesetter: CTTypesetterRef,
-    _range: NSRange,
+    range: NSRange,
 ) -> CTLineRef {
     if typesetter.is_null() {
         return nil;
@@ -687,10 +687,38 @@ fn CTTypesetterCreateLine(
         .borrow::<CTTypesetterHostObject>(typesetter)
         .attr_string;
     let (text, font, attributes) = string_and_font_from_attr_string(env, attr_string);
-    retain(env, text);
+
+    // Build the line only from the requested range (length 0 means "to the
+    // end"), and drop trailing line terminators so that they are not drawn
+    // as missing-glyph boxes.
+    let total: NSUInteger = msg![env; text length];
+    let start = range.location.min(total);
+    let mut len = if range.length == 0 {
+        total - start
+    } else {
+        range.length.min(total - start)
+    };
+    while len > 0 {
+        let last: unichar = msg![env; text characterAtIndex:(start + len - 1)];
+        if last == 0x0A || last == 0x0D || last == 0x2029 {
+            len -= 1;
+        } else {
+            break;
+        }
+    }
+    let line_text: id = if start == 0 && len == total {
+        text
+    } else {
+        let sub_range = NSRange {
+            location: start,
+            length: len,
+        };
+        msg![env; text substringWithRange:sub_range]
+    };
+    retain(env, line_text);
     retain(env, font);
     retain(env, attributes);
-    alloc_line(env, text, font, attributes)
+    alloc_line(env, line_text, font, attributes)
 }
 
 fn CTLineCreateWithAttributedString(
