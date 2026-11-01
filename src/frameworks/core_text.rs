@@ -483,6 +483,9 @@ fn CTFontCreateWithFontDescriptor(
     size: CGFloat,
     _matrix: ConstVoidPtr,
 ) -> CTFontRef {
+    if ct_trace2() {
+        log!("CT trace2: CTFontCreateWithFontDescriptor size {}", size);
+    }
     let font = font_from_descriptor(env, descriptor, size);
     retain(env, font);
     alloc_font(env, font)
@@ -691,9 +694,6 @@ fn CTLineGetTypographicBounds(
     descent: MutPtr<CGFloat>,
     leading: MutPtr<CGFloat>,
 ) -> CGFloat {
-    if ct_trace() {
-        log!("CT trace: CTLineGetTypographicBounds");
-    }
     if line.is_null() {
         return 0.0;
     }
@@ -706,6 +706,17 @@ fn CTLineGetTypographicBounds(
     let text_str = to_rust_string(env, text).into_owned();
     let font_obj = font_for_text(env, font, &text_str).unwrap_or_else(Font::sans_regular);
     let width = font_obj.calculate_text_size(size, &text_str, None).0;
+    if ct_trace2() {
+        log!(
+            "CT trace2: LineBounds text={:?} size={} width={} ascent={} descent={} leading={}",
+            text_str,
+            size,
+            width,
+            ascent_val,
+            -descender_val,
+            leading_val
+        );
+    }
     if !ascent.is_null() {
         env.mem.write(ascent, ascent_val);
     }
@@ -796,6 +807,14 @@ fn ct_trace() -> bool {
     COUNT.fetch_add(1, Ordering::Relaxed) < 600
 }
 
+/// Diagnostic only: separate budget for the "trace2" lines (values returned by
+/// the line measuring functions and which font a CTFont was made from).
+fn ct_trace2() -> bool {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static COUNT2: AtomicU32 = AtomicU32::new(0);
+    COUNT2.fetch_add(1, Ordering::Relaxed) < 900
+}
+
 /// Upper bound on glyphs drawn by one `CTFontDrawGlyphs` call. Guards against
 /// a garbage `count` making us allocate or read a huge amount of guest memory.
 const CT_FONT_DRAW_GLYPHS_MAX_COUNT: GuestUSize = 65536;
@@ -851,6 +870,15 @@ fn CTFontDrawGlyphs(
         glyph_positions.push((position.x, position.y));
     }
 
+    if ct_trace2() {
+        let font_name_id: id = msg![env; ui_font fontName];
+        let font_name = if font_name_id == nil {
+            String::from("(nil)")
+        } else {
+            to_rust_string(env, font_name_id).into_owned()
+        };
+        log!("CT trace2: DrawGlyphs font name {:?}", font_name);
+    }
     if ct_trace() {
         let ctm = CGContextGetCTM(env, context);
         let (ctm_a, ctm_d, ctm_tx, ctm_ty) = (ctm.a, ctm.d, ctm.tx, ctm.ty);
@@ -1508,10 +1536,19 @@ fn CTFontCreateWithGraphicsFont(
     // with bundled fonts); substituting the system font turned icons into
     // plain letters. A CGFont made from a font name is a UIFont here.
     let ui_font: id = if let Some(font) = data_provider_font(env, graphics_font) {
+        if ct_trace2() {
+            log!("CT trace2: CTFontCreateWithGraphicsFont size {} -> custom data-provider font", font_size);
+        }
         new_uifont_with_custom_font(env, font, font_size)
     } else if is_uifont(env, graphics_font) {
+        if ct_trace2() {
+            log!("CT trace2: CTFontCreateWithGraphicsFont size {} -> UIFont copy", font_size);
+        }
         msg![env; graphics_font fontWithSize:font_size]
     } else {
+        if ct_trace2() {
+            log!("CT trace2: CTFontCreateWithGraphicsFont size {} -> SYSTEM FONT FALLBACK", font_size);
+        }
         msg_class![env; UIFont systemFontOfSize:font_size]
     };
     retain(env, ui_font);
@@ -1531,6 +1568,9 @@ fn CTFontManagerRegisterGraphicsFont(
     }
     if font.is_null() {
         return false;
+    }
+    if ct_trace2() {
+        log!("CT trace2: CTFontManagerRegisterGraphicsFont called");
     }
     true
 }
@@ -1838,9 +1878,24 @@ fn CTTypesetterSuggestLineBreak(
     start_index: CFIndex,
     width: f64,
 ) -> CFIndex {
-    if ct_trace() {
-        log!("CT trace: CTTypesetterSuggestLineBreak");
+    let result = suggest_line_break_inner(env, typesetter, start_index, width);
+    if ct_trace2() {
+        log!(
+            "CT trace2: SuggestLineBreak start={} width={} -> {}",
+            start_index,
+            width,
+            result
+        );
     }
+    result
+}
+
+fn suggest_line_break_inner(
+    env: &mut Environment,
+    typesetter: CTTypesetterRef,
+    start_index: CFIndex,
+    width: f64,
+) -> CFIndex {
     if typesetter.is_null() {
         return 0;
     }
@@ -2192,4 +2247,4 @@ mod tests {
         assert_eq!(system_font_file("Courier New", "Bold Italic"), "LiberationMono-BoldItalic.ttf");
         assert_eq!(system_font_file("", ""), "LiberationSans-Regular.ttf");
     }
-        }
+    }
