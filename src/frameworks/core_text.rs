@@ -55,7 +55,7 @@ use crate::frameworks::uikit::ui_font::{
     custom_font_of_uifont, draw_font_glyph, font_for_text, font_from_uifont, is_uifont,
     new_uifont_with_custom_font, new_uifont_with_name,
 };
-use crate::mem::{ConstPtr, ConstVoidPtr, MutPtr, Ptr};
+use crate::mem::{ConstPtr, ConstVoidPtr, GuestUSize, MutPtr, Ptr};
 use crate::objc::{
     autorelease, id, msg, msg_class, nil, objc_classes, release, retain, ClassExports, HostObject,
 };
@@ -774,6 +774,72 @@ fn CTLineDraw(env: &mut Environment, line: CTLineRef, context: id) {
     if needs_y_flip {
         CGContextRestoreGState(env, context);
     }
+}
+
+/// Upper bound on glyphs drawn by one `CTFontDrawGlyphs` call. Guards against
+/// a garbage `count` making us allocate or read a huge amount of guest memory.
+const CT_FONT_DRAW_GLYPHS_MAX_COUNT: GuestUSize = 65536;
+
+/// `void CTFontDrawGlyphs(CTFontRef font, const CGGlyph glyphs[],
+///     const CGPoint positions[], size_t count, CGContextRef context)`
+///
+/// Draws `count` glyphs of `font` into a bitmap context, glyph `i` with its
+/// origin at `positions[i]` in the context's user space. The glyph IDs are the
+/// ones produced by `CTFontGetGlyphsForCharacters` /
+/// `CTRunGetGlyphs`, i.e. indices into the font backing the `CTFont`.
+///
+/// This is the same operation as `CGContextShowGlyphsAtPositions`, so it uses
+/// the same rasterization path (`Font::draw_glyphs_at_positions`, whose y axis
+/// points up like CoreGraphics user space). Unlike `CTLineDraw` it must not
+/// flip the context: glyph positions are given in user space, so whatever CTM
+/// the app set up applies.
+///
+/// Known limitation: glyph IDs are only meaningful for the font they came
+/// from. `CTFontGetGlyphsForCharacters` can pick a fallback font for text the
+/// primary font cannot show (e.g. CJK or Arabic), but here the primary font of
+/// the `CTFont` is used.
+///
+/// Reference: <https://developer.apple.com/documentation/coretext/ctfontdrawglyphs(_:_:_:_:_:)>
+fn CTFontDrawGlyphs(
+    env: &mut Environment,
+    font: CTFontRef,
+    glyphs: ConstPtr<CGGlyph>,
+    positions: ConstPtr<CGPoint>,
+    count: GuestUSize,
+    context: id,
+) {
+    if font.is_null()
+        || glyphs.is_null()
+        || positions.is_null()
+        || context.is_null()
+        || count == 0
+    {
+        return;
+    }
+    let count = count.min(CT_FONT_DRAW_GLYPHS_MAX_COUNT);
+
+    let ui_font = env.objc.borrow::<CTFontHostObject>(font).font;
+    let font_obj = font_from_uifont(env, ui_font).unwrap_or_else(Font::sans_regular);
+    let size: CGFloat = CTFontGetSize(env, font);
+
+    let mut glyph_ids = Vec::with_capacity(count as usize);
+    let mut glyph_positions = Vec::with_capacity(count as usize);
+    for i in 0..count {
+        let glyph: CGGlyph = env.mem.read(glyphs + i);
+        let position: CGPoint = env.mem.read(positions + i);
+        glyph_ids.push(GlyphId(glyph));
+        glyph_positions.push((position.x, position.y));
+    }
+
+    let mut drawer = CGBitmapContextDrawer::new(&env.objc, &mut env.mem, context);
+    let fill_color = drawer.rgb_fill_color();
+    font_obj.draw_glyphs_at_positions(
+        size,
+        &glyph_ids,
+        &glyph_positions,
+        (0.0, 0.0),
+        |raster_glyph| draw_font_glyph(&mut drawer, raster_glyph, fill_color, None, None),
+    );
 }
 
 /// `CFIndex CTLineGetGlyphCount(CTLineRef line)`
@@ -1797,6 +1863,7 @@ pub const FUNCTIONS: FunctionExports = &[
     export_c_func!(CTLineGetTypographicBounds(_, _, _, _)),
     export_c_func!(CTLineGetImageBounds(_, _)),
     export_c_func!(CTLineDraw(_, _)),
+    export_c_func!(CTFontDrawGlyphs(_, _, _, _, _)),
     export_c_func!(CTLineGetGlyphCount(_)),
     export_c_func!(CTLineGetGlyphRuns(_)),
     export_c_func!(CTFontGetGlyphsForCharacters(_, _, _, _)),
