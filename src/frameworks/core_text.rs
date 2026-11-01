@@ -260,6 +260,26 @@ fn font_from_descriptor(
     if attrs == nil {
         return msg_class![env; UIFont systemFontOfSize:size];
     }
+    // A descriptor made by `CTFontCopyFontDescriptor` from a font loaded from
+    // app-supplied data carries that UIFont under a private key; rebuild the
+    // custom font at the requested size instead of looking a name up.
+    {
+        let custom_key = get_static_str(env, CT_CUSTOM_UIFONT_KEY);
+        let carried: id = msg![env; attrs objectForKey:custom_key];
+        if carried != nil {
+            if let Some(custom) = custom_font_of_uifont(env, carried) {
+                let font_size: CGFloat = if size > 0.0 {
+                    size
+                } else {
+                    msg![env; carried pointSize]
+                };
+                if ct_log_once(format!("descriptor->custom size {}", font_size)) {
+                    log!("CT diag: descriptor resolved to custom font, size {}", font_size);
+                }
+                return new_uifont_with_custom_font(env, custom, font_size);
+            }
+        }
+    }
     let font_name_key =
         crate::frameworks::foundation::ns_string::get_static_str(env, "NSFontNameAttribute");
     let family_key =
@@ -497,7 +517,13 @@ fn CTFontCreateWithName(
     size: CGFloat,
     _matrix: ConstVoidPtr,
 ) -> CTFontRef {
-    if ct_trace() {
+    if !name.is_null() {
+        let n = to_rust_string(env, name).into_owned();
+        if ct_log_once(format!("byname {} {}", n, size)) {
+            log!("CT diag: CTFontCreateWithName({:?}, size {})", n, size);
+        }
+    }
+    if false && ct_trace() {
         let n = if name.is_null() { String::new() } else { to_rust_string(env, name).into_owned() };
         log!("CT trace: CTFontCreateWithName({:?}, size {})", n, size);
     }
@@ -565,7 +591,9 @@ fn CTFontCreateCopyWithAttributes(
             let family_key = get_static_str(env, "NSFontFamilyAttribute");
             let by_name: id = msg![env; attrs objectForKey:name_key];
             let by_family: id = msg![env; attrs objectForKey:family_key];
-            by_name != nil || by_family != nil
+            let custom_key = get_static_str(env, CT_CUSTOM_UIFONT_KEY);
+            let by_custom: id = msg![env; attrs objectForKey:custom_key];
+            by_name != nil || by_family != nil || by_custom != nil
         }
     };
 
@@ -706,9 +734,11 @@ fn CTLineGetTypographicBounds(
     let text_str = to_rust_string(env, text).into_owned();
     let font_obj = font_for_text(env, font, &text_str).unwrap_or_else(Font::sans_regular);
     let width = font_obj.calculate_text_size(size, &text_str, None).0;
-    if ct_trace2() {
+    if ct_log_once(format!("lb {} {}", text_str, size)) {
+        let is_custom = custom_font_of_uifont(env, font).is_some();
         log!(
-            "CT trace2: LineBounds text={:?} size={} width={} ascent={} descent={} leading={}",
+            "CT diag: LineBounds custom={} text={:?} size={} width={} ascent={} descent={} leading={}",
+            is_custom,
             text_str,
             size,
             width,
@@ -800,6 +830,21 @@ fn CTLineDraw(env: &mut Environment, line: CTLineRef, context: id) {
     }
 }
 
+/// Private descriptor attribute holding the custom (data-provider) UIFont a
+/// descriptor was copied from. Survives `CTFontDescriptorCreateCopyWithAttributes`
+/// because that merges dictionaries.
+const CT_CUSTOM_UIFONT_KEY: &str = "_touchHLE_CTCustomUIFont";
+
+/// Diagnostic only: true the first time a given message key is seen.
+fn ct_log_once(key: String) -> bool {
+    use std::collections::HashSet;
+    use std::sync::{Mutex, OnceLock};
+    static SEEN: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+    let set = SEEN.get_or_init(|| Mutex::new(HashSet::new()));
+    let mut guard = set.lock().unwrap();
+    guard.len() < 2500 && guard.insert(key)
+}
+
 /// Diagnostic only: limits how many CoreText trace lines are logged.
 fn ct_trace() -> bool {
     use std::sync::atomic::{AtomicU32, Ordering};
@@ -870,16 +915,22 @@ fn CTFontDrawGlyphs(
         glyph_positions.push((position.x, position.y));
     }
 
-    if ct_trace2() {
+    {
+        let is_custom = custom_font_of_uifont(env, ui_font).is_some();
         let font_name_id: id = msg![env; ui_font fontName];
         let font_name = if font_name_id == nil {
             String::from("(nil)")
         } else {
             to_rust_string(env, font_name_id).into_owned()
         };
-        log!("CT trace2: DrawGlyphs font name {:?}", font_name);
+        if ct_log_once(format!("draw {} {} {}", font_name, is_custom, size)) {
+            log!(
+                "CT diag: DrawGlyphs font {:?} custom={} size {}",
+                font_name, is_custom, size
+            );
+        }
     }
-    if ct_trace() {
+    if false && ct_trace() {
         let ctm = CGContextGetCTM(env, context);
         let (ctm_a, ctm_d, ctm_tx, ctm_ty) = (ctm.a, ctm.d, ctm.tx, ctm.ty);
         let width = crate::frameworks::core_graphics::cg_bitmap_context::CGBitmapContextGetWidth(env, context);
@@ -1725,6 +1776,14 @@ fn CTFontCopyFontDescriptor(env: &mut Environment, font: CTFontRef) -> CTFontDes
         let key = get_static_str(env, "NSFontNameAttribute");
         () = msg![env; attrs setObject:name forKey:key];
         release(env, name);
+    }
+    let ui_font = ui_font_for_ct_font(env, font);
+    if ui_font != nil && custom_font_of_uifont(env, ui_font).is_some() {
+        let key = get_static_str(env, CT_CUSTOM_UIFONT_KEY);
+        () = msg![env; attrs setObject:ui_font forKey:key];
+        if ct_log_once("copy_descriptor custom".to_string()) {
+            log!("CT diag: CTFontCopyFontDescriptor on custom font -> descriptor carries it");
+        }
     }
     retain(env, attrs);
     alloc_descriptor(env, attrs)
