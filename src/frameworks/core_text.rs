@@ -494,6 +494,10 @@ fn CTFontCreateWithName(
     size: CGFloat,
     _matrix: ConstVoidPtr,
 ) -> CTFontRef {
+    if ct_trace() {
+        let n = if name.is_null() { String::new() } else { to_rust_string(env, name).into_owned() };
+        log!("CT trace: CTFontCreateWithName({:?}, size {})", n, size);
+    }
     if name.is_null() {
         return nil;
     }
@@ -687,6 +691,9 @@ fn CTLineGetTypographicBounds(
     descent: MutPtr<CGFloat>,
     leading: MutPtr<CGFloat>,
 ) -> CGFloat {
+    if ct_trace() {
+        log!("CT trace: CTLineGetTypographicBounds");
+    }
     if line.is_null() {
         return 0.0;
     }
@@ -712,6 +719,9 @@ fn CTLineGetTypographicBounds(
 }
 
 fn CTLineGetImageBounds(env: &mut Environment, line: CTLineRef, _context: id) -> CGRect {
+    if ct_trace() {
+        log!("CT trace: CTLineGetImageBounds");
+    }
     if line.is_null() {
         return CGRect::default();
     }
@@ -735,6 +745,9 @@ fn CTLineGetImageBounds(env: &mut Environment, line: CTLineRef, _context: id) ->
 }
 
 fn CTLineDraw(env: &mut Environment, line: CTLineRef, context: id) {
+    if ct_trace() {
+        log!("CT trace: CTLineDraw");
+    }
     if line.is_null() || context.is_null() {
         return;
     }
@@ -774,6 +787,13 @@ fn CTLineDraw(env: &mut Environment, line: CTLineRef, context: id) {
     if needs_y_flip {
         CGContextRestoreGState(env, context);
     }
+}
+
+/// Diagnostic only: limits how many CoreText trace lines are logged.
+fn ct_trace() -> bool {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static COUNT: AtomicU32 = AtomicU32::new(0);
+    COUNT.fetch_add(1, Ordering::Relaxed) < 600
 }
 
 /// Upper bound on glyphs drawn by one `CTFontDrawGlyphs` call. Guards against
@@ -831,6 +851,24 @@ fn CTFontDrawGlyphs(
         glyph_positions.push((position.x, position.y));
     }
 
+    if ct_trace() {
+        let ctm = CGContextGetCTM(env, context);
+        let width = crate::frameworks::core_graphics::cg_bitmap_context::CGBitmapContextGetWidth(env, context);
+        let height = CGBitmapContextGetHeight(env, context);
+        log!(
+            "CT trace: CTFontDrawGlyphs count {} size {} first pos {:?} last pos {:?} ctx {}x{} ctm a={} d={} tx={} ty={}",
+            count,
+            size,
+            glyph_positions.first(),
+            glyph_positions.last(),
+            width,
+            height,
+            ctm.a,
+            ctm.d,
+            ctm.tx,
+            ctm.ty
+        );
+    }
     let mut drawer = CGBitmapContextDrawer::new(&env.objc, &mut env.mem, context);
     let fill_color = drawer.rgb_fill_color();
     font_obj.draw_glyphs_at_positions(
@@ -1061,6 +1099,9 @@ fn CTFontGetAdvancesForGlyphs(
     advances: MutPtr<CGSize>,
     count: i32,
 ) -> f64 {
+    if ct_trace() {
+        log!("CT trace: CTFontGetAdvancesForGlyphs count {} size {}", count, CTFontGetSize(env, font));
+    }
     if font.is_null() || glyphs.is_null() || count <= 0 {
         return 0.0;
     }
@@ -1089,6 +1130,9 @@ fn CTFontGetBoundingRectsForGlyphs(
     bounding_rects: MutPtr<CGRect>,
     count: CFIndex,
 ) -> CGRect {
+    if ct_trace() {
+        log!("CT trace: CTFontGetBoundingRectsForGlyphs count {}", count);
+    }
     let empty = CGRect {
         origin: CGPoint { x: 0.0, y: 0.0 },
         size: CGSize { width: 0.0, height: 0.0 },
@@ -1142,6 +1186,9 @@ fn CTFontGetGlyphsForCharacters(
     glyphs: MutPtr<CGGlyph>,
     count: i32,
 ) -> bool {
+    if ct_trace() {
+        log!("CT trace: CTFontGetGlyphsForCharacters count {}", count);
+    }
     if font.is_null() || characters.is_null() || glyphs.is_null() || count <= 0 {
         return false;
     }
@@ -1243,6 +1290,9 @@ fn CTFramesetterSuggestFrameSizeWithConstraints(
     constraints: CGSize,
     fit_range: MutPtr<CFRange>,
 ) -> CGSize {
+    if ct_trace() {
+        log!("CT trace: CTFramesetterSuggestFrameSizeWithConstraints constraints {}x{}", constraints.width, constraints.height);
+    }
     if framesetter.is_null() {
         if !fit_range.is_null() {
             env.mem.write(
@@ -1786,6 +1836,9 @@ fn CTTypesetterSuggestLineBreak(
     start_index: CFIndex,
     width: f64,
 ) -> CFIndex {
+    if ct_trace() {
+        log!("CT trace: CTTypesetterSuggestLineBreak");
+    }
     if typesetter.is_null() {
         return 0;
     }
@@ -2137,4 +2190,4 @@ mod tests {
         assert_eq!(system_font_file("Courier New", "Bold Italic"), "LiberationMono-BoldItalic.ttf");
         assert_eq!(system_font_file("", ""), "LiberationSans-Regular.ttf");
     }
-}
+    }
