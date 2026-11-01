@@ -728,6 +728,7 @@ fn CTLineGetTypographicBounds(
     let text = line_text(env, line);
     let font = line_font(env, line);
     let size: CGFloat = msg![env; font pointSize];
+    let size = size * em_fix(env, font);
     let ascent_val: CGFloat = msg![env; font ascender];
     let descender_val: CGFloat = msg![env; font descender];
     let leading_val: CGFloat = msg![env; font leading];
@@ -769,6 +770,7 @@ fn CTLineGetImageBounds(env: &mut Environment, line: CTLineRef, _context: id) ->
     let text = line_text(env, line);
     let font = line_font(env, line);
     let size: CGFloat = msg![env; font pointSize];
+    let size = size * em_fix(env, font);
     let ascent_val: CGFloat = msg![env; font ascender];
     let text_str = to_rust_string(env, text).into_owned();
     let font_obj = font_for_text(env, font, &text_str).unwrap_or_else(Font::sans_regular);
@@ -795,6 +797,7 @@ fn CTLineDraw(env: &mut Environment, line: CTLineRef, context: id) {
     let text = line_text(env, line);
     let font = line_font(env, line);
     let size: CGFloat = msg![env; font pointSize];
+    let size = size * em_fix(env, font);
     let text_str = to_rust_string(env, text).into_owned();
     let font_obj = font_for_text(env, font, &text_str).unwrap_or_else(Font::sans_regular);
     let needs_y_flip = CGContextGetCTM(env, context).d > 0.0;
@@ -828,6 +831,40 @@ fn CTLineDraw(env: &mut Environment, line: CTLineRef, context: id) {
     if needs_y_flip {
         CGContextRestoreGState(env, context);
     }
+}
+
+/// The Font layer scales a face so that (hhea ascent - descent) equals 1.125 em
+/// of the requested size (measured: Deputy 1.0 em tall -> text 12.5% too wide,
+/// Lilita One 1.143 em tall -> 1.6% too narrow). Real CoreText uses the plain
+/// point size as the em size, so return the factor to pre-multiply the size
+/// with so the effective em equals the requested size.
+fn em_fix(env: &mut Environment, ui_font: id) -> CGFloat {
+    if ui_font == nil {
+        return 1.0;
+    }
+    let Some(custom) = custom_font_of_uifont(env, ui_font) else {
+        return 1.0;
+    };
+    let (Some(head), Some(hhea)) = (custom.table_data(0x68656164), custom.table_data(0x68686561))
+    else {
+        return 1.0;
+    };
+    let head: &[u8] = &head;
+    let hhea: &[u8] = &hhea;
+    if head.len() < 20 || hhea.len() < 8 {
+        return 1.0;
+    }
+    let upem = u16::from_be_bytes([head[18], head[19]]) as f64;
+    let asc = i16::from_be_bytes([hhea[4], hhea[5]]) as f64;
+    let desc = i16::from_be_bytes([hhea[6], hhea[7]]) as f64;
+    if upem <= 0.0 || asc - desc <= 0.0 {
+        return 1.0;
+    }
+    let k = (((asc - desc) / upem) / 1.125).clamp(0.5, 2.0);
+    if ct_log_once(format!("emfix {}", k)) {
+        log!("CT diag: em_fix factor {} (upem {}, hhea asc {} desc {})", k, upem, asc, desc);
+    }
+    k as CGFloat
 }
 
 /// Private descriptor attribute holding the custom (data-provider) UIFont a
@@ -905,6 +942,7 @@ fn CTFontDrawGlyphs(
     let ui_font = env.objc.borrow::<CTFontHostObject>(font).font;
     let font_obj = font_from_uifont(env, ui_font).unwrap_or_else(Font::sans_regular);
     let size: CGFloat = CTFontGetSize(env, font);
+    let size = size * em_fix(env, ui_font);
 
     let mut glyph_ids = Vec::with_capacity(count as usize);
     let mut glyph_positions = Vec::with_capacity(count as usize);
@@ -948,6 +986,25 @@ fn CTFontDrawGlyphs(
             ctm_tx,
             ctm_ty
         );
+    }
+    {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static DRAW_LOGS: AtomicU32 = AtomicU32::new(0);
+        // Clock text is 28.125pt: log all of its draws (up to 300); everything
+        // else only once per (glyph, size) so the loading screen can't use up
+        // the budget.
+        let first_seen = ct_log_once(format!("draw1 {:?} {}", glyph_ids.iter().map(|g| g.0).collect::<Vec<_>>(), size));
+        let is_clock_size = (size - 28.125 * em_fix(env, ui_font)).abs() < 0.2;
+        if (is_clock_size && DRAW_LOGS.fetch_add(1, Ordering::Relaxed) < 300) || first_seen {
+            let ctm = CGContextGetCTM(env, context);
+            let cw = crate::frameworks::core_graphics::cg_bitmap_context::CGBitmapContextGetWidth(env, context);
+            let ch = CGBitmapContextGetHeight(env, context);
+            log!(
+                "CT diag: Draw glyphs {:?} size {} at {:?} ctx {}x{} ctm a={} d={} tx={} ty={}",
+                glyph_ids.iter().map(|g| g.0).collect::<Vec<_>>(),
+                size, glyph_positions, cw, ch, ctm.a, ctm.d, ctm.tx, ctm.ty
+            );
+        }
     }
     let mut drawer = CGBitmapContextDrawer::new(&env.objc, &mut env.mem, context);
     let fill_color = drawer.rgb_fill_color();
@@ -1143,6 +1200,7 @@ fn CTRunGetPositions(env: &mut Environment, run: CTRunRef, range: CFRange, buffe
     let text_str = to_rust_string(env, text).into_owned();
     let font = font_for_text(env, ui_font, &text_str).unwrap_or_else(Font::sans_regular);
     let size: CGFloat = msg![env; ui_font pointSize];
+    let size = size * em_fix(env, ui_font);
     let glyphs: Vec<GlyphId> = (0..end)
         .map(|text_index| {
             let character: unichar = msg![env; text characterAtIndex:(text_index as NSUInteger)];
@@ -1188,10 +1246,14 @@ fn CTFontGetAdvancesForGlyphs(
     let ui_font = env.objc.borrow::<CTFontHostObject>(font).font;
     let font_obj = font_from_uifont(env, ui_font).unwrap_or_else(Font::sans_regular);
     let size = CTFontGetSize(env, font);
+    let size = size * em_fix(env, ui_font);
     let mut total = 0.0f64;
     for i in 0..count as u32 {
         let glyph_id: CGGlyph = env.mem.read(glyphs + i);
         let advance_pt = font_obj.glyph_advance_at_size(GlyphId(glyph_id), size) as f64;
+        if ct_log_once(format!("adv {} {}", glyph_id, size)) {
+            log!("CT diag: Advance glyph {} size {} -> {}", glyph_id, size, advance_pt);
+        }
         if !advances.is_null() {
             env.mem.write(advances + i, CGSize { width: advance_pt as CGFloat, height: 0.0 });
         }
@@ -1223,6 +1285,7 @@ fn CTFontGetBoundingRectsForGlyphs(
     let ui_font = env.objc.borrow::<CTFontHostObject>(font).font;
     let font_obj = font_from_uifont(env, ui_font).unwrap_or_else(Font::sans_regular);
     let size = CTFontGetSize(env, font);
+    let size = size * em_fix(env, ui_font);
     let mut union: Option<CGRect> = None;
     for index in 0..count as u32 {
         let glyph = env.mem.read(glyphs + index);
@@ -1231,6 +1294,12 @@ fn CTFontGetBoundingRectsForGlyphs(
             origin: CGPoint { x, y },
             size: CGSize { width, height },
         };
+        if ct_log_once(format!("bbox {} {}", glyph, size)) {
+            log!(
+                "CT diag: BBox glyph {} size {} -> x {} y {} w {} h {}",
+                glyph, size, x, y, width, height
+            );
+        }
         if !bounding_rects.is_null() {
             env.mem.write(bounding_rects + index, rect);
         }
@@ -1286,9 +1355,22 @@ fn CTFontGetGlyphsForCharacters(
     for i in 0..count as u32 {
         let c: unichar = env.mem.read(characters + i);
         let glyph_id = font_obj.glyph_id_for_char(c);
-        let g = glyph_id.0;
-        if g == 0 {
+        let mut g = glyph_id.0;
+        if g == 0 && (c < 0x20 || c == 0x2028 || c == 0x2029) {
+            // Control characters / line separators have no visible glyph;
+            // using .notdef would draw an empty box (seen as a square in
+            // "Invite friends and []play together"). Use the space glyph.
+            g = font_obj.glyph_id_for_char(0x20).0;
+        } else if g == 0 {
             all_mapped = false;
+        }
+        if ct_log_once(format!("glyphmap {} {}", c, g)) {
+            let primary = font_from_uifont(env, ui_font).unwrap_or_else(Font::sans_regular);
+            let pg = primary.glyph_id_for_char(c).0;
+            log!(
+                "CT diag: GlyphsForCharacters char U+{:04X} -> glyph {} (primary font would give {}){}",
+                c, g, pg, if pg != g { "  <-- MISMATCH" } else { "" }
+            );
         }
         env.mem.write(glyphs + i, g);
     }
@@ -1395,6 +1477,7 @@ fn CTFramesetterSuggestFrameSizeWithConstraints(
         .attr_string;
     let (text, font, _) = string_and_font_from_attr_string(env, attr_string);
     let size: CGFloat = msg![env; font pointSize];
+    let size = size * em_fix(env, font);
     let text_str = to_rust_string(env, text).into_owned();
     let font_obj = font_for_text(env, font, &text_str).unwrap_or_else(Font::sans_regular);
 
@@ -1841,6 +1924,7 @@ fn ct_line_offset(env: &mut Environment, line: CTLineRef, char_index: CFIndex) -
     let text_str = to_rust_string(env, text).into_owned();
     let font = font_for_text(env, ui_font, &text_str).unwrap_or_else(Font::sans_regular);
     let size: CGFloat = msg![env; ui_font pointSize];
+    let size = size * em_fix(env, ui_font);
     let upto = char_index.min(count).max(0) as u32;
     let mut width = 0.0f64;
     for text_index in 0..upto {
@@ -1885,6 +1969,7 @@ fn CTRunGetAdvances(env: &mut Environment, run: CTRunRef, range: CFRange, buffer
     let text_str = to_rust_string(env, text).into_owned();
     let font = font_for_text(env, ui_font, &text_str).unwrap_or_else(Font::sans_regular);
     let size: CGFloat = msg![env; ui_font pointSize];
+    let size = size * em_fix(env, ui_font);
     for text_index in start..end {
         let character: unichar = msg![env; text characterAtIndex:(text_index as NSUInteger)];
         let glyph = GlyphId(glyph_for_code_unit(&font, character));
@@ -1975,6 +2060,7 @@ fn suggest_line_break_inner(
     let text_str = to_rust_string(env, text).into_owned();
     let font = font_for_text(env, ui_font, &text_str).unwrap_or_else(Font::sans_regular);
     let size: CGFloat = msg![env; ui_font pointSize];
+    let size = size * em_fix(env, ui_font);
     let mut used = 0.0f64;
     let mut last_break: Option<CFIndex> = None;
     let mut index = start;
@@ -1982,8 +2068,17 @@ fn suggest_line_break_inner(
         let character: unichar = msg![env; text characterAtIndex:(index as NSUInteger)];
         let advance = font.glyph_advance_at_size(GlyphId(glyph_for_code_unit(&font, character)), size)
             as f64;
-        if character == 0x0A {
-            return index + 1 - start;
+        if character == 0x0A || character == 0x0D || character == 0x2029 {
+            // CoreText treats CR, LF, CRLF and U+2029 as paragraph breaks;
+            // swallow the LF of a CRLF pair so it is not drawn as a glyph.
+            let mut end = index + 1;
+            if character == 0x0D && end < total {
+                let next: unichar = msg![env; text characterAtIndex:(end as NSUInteger)];
+                if next == 0x0A {
+                    end += 1;
+                }
+            }
+            return end - start;
         }
         if used + advance > width && index > start {
             return match last_break {
