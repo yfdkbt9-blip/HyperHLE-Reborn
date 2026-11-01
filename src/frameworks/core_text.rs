@@ -660,7 +660,12 @@ fn CTFontGetLeading(env: &mut Environment, font: CTFontRef) -> CGFloat {
     if ui_font == nil {
         return 0.0;
     }
-    msg![env; ui_font leading]
+    // CoreText "leading" is the extra line gap, not the whole line height
+    // (which is what UIKit's old `-[UIFont leading]` returns here).
+    let size: CGFloat = msg![env; ui_font pointSize];
+    let size = size * em_fix(env, ui_font);
+    let font_obj = font_from_uifont(env, ui_font).unwrap_or_else(Font::sans_regular);
+    font_obj.line_gap(size)
 }
 
 fn CTTypesetterCreateWithAttributedString(
@@ -743,13 +748,20 @@ fn line_font(env: &mut Environment, line: CTLineRef) -> id {
     env.objc.borrow::<CTLineHostObject>(line).font
 }
 
+/// `double CTLineGetTypographicBounds(CTLineRef line, CGFloat *ascent,
+///     CGFloat *descent, CGFloat *leading)`
+///
+/// The return type is `double` in the real API (unlike `CGFloat`, which is a
+/// 32-bit float on 32-bit iOS). Returning an `f32` here would leave the high
+/// word of the guest's `r0:r1` result undefined, so callers would read a
+/// garbage (typically near-zero) width.
 fn CTLineGetTypographicBounds(
     env: &mut Environment,
     line: CTLineRef,
     ascent: MutPtr<CGFloat>,
     descent: MutPtr<CGFloat>,
     leading: MutPtr<CGFloat>,
-) -> CGFloat {
+) -> f64 {
     if line.is_null() {
         return 0.0;
     }
@@ -759,9 +771,11 @@ fn CTLineGetTypographicBounds(
     let size = size * em_fix(env, font);
     let ascent_val: CGFloat = msg![env; font ascender];
     let descender_val: CGFloat = msg![env; font descender];
-    let leading_val: CGFloat = msg![env; font leading];
     let text_str = to_rust_string(env, text).into_owned();
     let font_obj = font_for_text(env, font, &text_str).unwrap_or_else(Font::sans_regular);
+    // CoreText "leading" is the extra line gap, not the whole line height
+    // (which is what UIKit's old `-[UIFont leading]` returns here).
+    let leading_val: CGFloat = font_obj.line_gap(size);
     let width = font_obj.calculate_text_size(size, &text_str, None).0;
     if ct_log_once(format!("lb {} {}", text_str, size)) {
         let is_custom = custom_font_of_uifont(env, font).is_some();
@@ -785,7 +799,7 @@ fn CTLineGetTypographicBounds(
     if !leading.is_null() {
         env.mem.write(leading, leading_val);
     }
-    width
+    width as f64
 }
 
 fn CTLineGetImageBounds(env: &mut Environment, line: CTLineRef, _context: id) -> CGRect {
