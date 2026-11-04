@@ -220,6 +220,16 @@ fn apply_chained_rebases(payload: &[u8], segments: &[Segment], image_base: Guest
 }
 
 impl MachOImage {
+    /// Decode the image's exported symbols, if it contains an export trie.
+    pub fn exported_symbols(
+        &self,
+    ) -> Result<Vec<super::dyld::ExportedSymbol>, super::dyld::ExportTrieError> {
+        match self.exports_trie.as_deref() {
+            Some(trie) => super::dyld::parse_export_trie(trie),
+            None => Ok(Vec::new()),
+        }
+    }
+
     /// Parse an ARM64 Mach-O executable and map its 64-bit segments.
     /// slide is added to every guest virtual address.
     pub fn load(bytes: &[u8], memory: &mut GuestMemory, slide: GuestAddr) -> Result<Self, MachOError> {
