@@ -157,6 +157,7 @@ fn main() {
     let mut wrapper_build = cc::Build::new();
     wrapper_build
         .file(package_root.join("lib.cpp"))
+        .file(package_root.join("arm64.cpp"))
         .cpp(true)
         .std("c++17")
         .include(dynarmic_out.join("include"));
