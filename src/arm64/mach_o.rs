@@ -572,6 +572,13 @@ impl MachOImage {
                     dynamic_libraries.push(name.clone());
                     dependencies.push(DylibDependency { install_name: name, kind: DylibDependencyKind::Upward });
                 }
+                LoadCommand::LazyLoadDylib(dylib) => {
+                    // Until lazy bind opcodes are implemented, load these eagerly
+                    // so their symbols are available before the first call.
+                    let name = dylib.name.to_string();
+                    dynamic_libraries.push(name.clone());
+                    dependencies.push(DylibDependency { install_name: name, kind: DylibDependencyKind::Required });
+                }
                 LoadCommand::Rpath(path) => rpaths.push(path.clone()),
                 _ => {}
             }
