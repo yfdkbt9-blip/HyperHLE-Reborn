@@ -38,7 +38,7 @@ pub enum MachOError {
     Parse, WrongArchitecture, UnsupportedSubtype, MissingTextSegment,
     DuplicateTextSegment, DuplicateChainedFixups, DuplicateExportsTrie, ConflictingExportsTrieCommands, MissingEntryPoint, EntryPointOutsideText,
     InvalidSegmentRange, InvalidChainedFixups, InvalidExportsTrie, UnsupportedPointerFormat, UnsupportedChainedBind, OverlappingSegments,
-    InvalidImportOrdinal, UnresolvedStrongImport(String), BindAddendOverflow, AddressOverflow, Memory(MemoryError),
+    InvalidImportOrdinal, UnresolvedStrongImport(String), BindAddendOverflow, DylibRegistry(super::dyld::DylibRegistryError), AddressOverflow, Memory(MemoryError),
 }
 impl From<MemoryError> for MachOError {
     fn from(value: MemoryError) -> Self { Self::Memory(value) }
@@ -231,6 +231,17 @@ pub fn apply_chained_binds_with_registry(
     registry: &super::dyld::DylibRegistry,
     importer_id: usize,
 ) -> Result<(), MachOError> {
+    // Validate all import ordinals before patching anything. The low-level
+    // binder accepts an Option resolver, so errors from the registry must not
+    // be silently converted into unresolved weak imports.
+    if let Some(payload) = image.chained_fixups.as_deref() {
+        let imports = super::dyld::parse_chained_imports(payload)
+            .map_err(|_| MachOError::InvalidChainedFixups)?;
+        for import in &imports {
+            registry.resolve(importer_id, import)
+                .map_err(MachOError::DylibRegistry)?;
+        }
+    }
     apply_chained_binds(image, memory, |import| {
         registry.resolve(importer_id, import).ok().flatten()
     })
