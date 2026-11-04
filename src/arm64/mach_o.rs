@@ -141,6 +141,7 @@ fn validate_chained_fixups(data: &[u8]) -> Result<(), MachOError> {
     let seg_count = usize::try_from(u32_at(data, starts_offset)?).map_err(|_| MachOError::InvalidChainedFixups)?;
     let offsets_start = starts_offset.checked_add(4).ok_or(MachOError::InvalidChainedFixups)?;
     let offsets = checked_range(offsets_start, seg_count, 4, data.len())?;
+    if offsets.end > imports_offset { return Err(MachOError::InvalidChainedFixups); }
     let minimum_segment_offset = offsets.end.checked_sub(starts_offset).ok_or(MachOError::InvalidChainedFixups)?;
     for index in 0..seg_count {
         let relative = usize::try_from(u32_at(data, offsets.start + index * 4)?)
