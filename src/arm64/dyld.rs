@@ -298,6 +298,19 @@ pub fn read_dylib_from_ipa<R: std::io::Read + std::io::Seek>(
     }
 }
 
+/// Resolve an app-bundled dependency first, then an extracted iOS runtime
+/// framework/library archive (a ZIP containing paths such as System/Library/Frameworks/...).
+pub fn read_dylib_from_ipa_or_runtime<A: std::io::Read + std::io::Seek, S: std::io::Read + std::io::Seek>(
+    app_archive: &mut zip::ZipArchive<A>,
+    runtime_archive: &mut zip::ZipArchive<S>,
+    candidate: &str,
+) -> Result<Option<Vec<u8>>, String> {
+    if let Some(bytes) = read_dylib_from_ipa(app_archive, candidate)? {
+        return Ok(Some(bytes));
+    }
+    read_dylib_from_ipa(runtime_archive, candidate)
+}
+
 /// Per-image dependency ordinals and globally loaded dylib exports.
 /// Ordinals are interpreted in the importing image's load-command order.
 #[derive(Clone, Debug, Default)]
