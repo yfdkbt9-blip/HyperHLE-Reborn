@@ -43,5 +43,11 @@ jobs:
           tar xzf boost.tar.gz -C vendor
           mv vendor/boost_1_81_0 vendor/boost
 
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Run ARM64 unit tests
+        run: cargo test --target aarch64-apple-darwin
+
       - name: Build ARM64 host target
         run: cargo build --target aarch64-apple-darwin --release
