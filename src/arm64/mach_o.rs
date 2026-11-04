@@ -25,6 +25,8 @@ pub struct MachOImage {
     pub segments: Vec<Segment>,
     pub entry_point: GuestAddr,
     pub dynamic_libraries: Vec<String>,
+    /// Raw LC_DYLD_CHAINED_FIXUPS payload. Parsed separately by the A64 dyld layer.
+    pub chained_fixups: Option<Vec<u8>>,
     pub text_base: GuestAddr,
     pub end_address: GuestAddr,
 }
@@ -32,7 +34,7 @@ pub struct MachOImage {
 #[derive(Debug)]
 pub enum MachOError {
     Parse, WrongArchitecture, UnsupportedSubtype, MissingTextSegment,
-    DuplicateTextSegment, MissingEntryPoint, EntryPointOutsideText,
+    DuplicateTextSegment, DuplicateChainedFixups, MissingEntryPoint, EntryPointOutsideText,
     InvalidSegmentRange, OverlappingSegments, AddressOverflow, Memory(MemoryError),
 }
 impl From<MemoryError> for MachOError {
@@ -104,6 +106,7 @@ impl MachOImage {
         let mut text_index = None;
         let mut entry_offset = None;
         let mut dynamic_libraries = Vec::new();
+        let mut chained_fixups = None;
         for MachCommand(command, _) in &commands {
             match command {
                 LoadCommand::Segment64 { segname, vmaddr, vmsize, fileoff, filesize, initprot, .. } => {
@@ -123,6 +126,15 @@ impl MachOImage {
                 }
                 LoadCommand::EntryPoint { entryoff, .. } => {
                     if entry_offset.replace(*entryoff).is_some() { return Err(MachOError::MissingEntryPoint); }
+                }
+                LoadCommand::DyldChainedFixups(data) => {
+                    if chained_fixups.is_some() { return Err(MachOError::DuplicateChainedFixups); }
+                    let start = usize::try_from(data.off).map_err(|_| MachOError::InvalidSegmentRange)?;
+                    let size = usize::try_from(data.size).map_err(|_| MachOError::InvalidSegmentRange)?;
+                    let finish = start.checked_add(size).ok_or(MachOError::InvalidSegmentRange)?;
+                    let payload = image_bytes.get(start..finish).ok_or(MachOError::InvalidSegmentRange)?;
+                    if size < 28 { return Err(MachOError::InvalidSegmentRange); }
+                    chained_fixups = Some(payload.to_vec());
                 }
                 LoadCommand::LoadDyLib(dylib) => dynamic_libraries.push(dylib.name.to_string()),
                 LoadCommand::LoadWeakDyLib(dylib) => dynamic_libraries.push(dylib.name.to_string()),
@@ -168,7 +180,7 @@ impl MachOImage {
                 memory.write(loaded_address, &image_bytes[start..finish])?;
             }
         }
-        Ok(Self { segments, entry_point, dynamic_libraries, text_base, end_address })
+        Ok(Self { segments, entry_point, dynamic_libraries, chained_fixups, text_base, end_address })
     }
 }
 
