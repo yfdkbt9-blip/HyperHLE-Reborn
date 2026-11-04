@@ -224,6 +224,18 @@ fn apply_chained_rebases(payload: &[u8], segments: &[Segment], image_base: Guest
 /// Resolve generic 64-bit chained binds. The resolver returns the absolute guest
 /// address of an imported symbol. Writes are staged so a missing strong symbol
 /// or malformed chain cannot leave guest memory half-patched.
+/// Apply binds using the shared A64 dylib registry and this image's ID.
+pub fn apply_chained_binds_with_registry(
+    image: &MachOImage,
+    memory: &mut GuestMemory,
+    registry: &super::dyld::DylibRegistry,
+    importer_id: usize,
+) -> Result<(), MachOError> {
+    apply_chained_binds(image, memory, |import| {
+        registry.resolve(importer_id, import).ok().flatten()
+    })
+}
+
 pub fn apply_chained_binds<F>(
     image: &MachOImage,
     memory: &mut GuestMemory,
