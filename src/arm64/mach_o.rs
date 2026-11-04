@@ -750,28 +750,32 @@ impl MachOImage {
                 return Err(MachOError::OverlappingSegments);
             }
         }
+        // Stage mappings and rebases so a malformed later segment/fixup cannot
+        // leave the caller's address space partially populated.
+        let mut staged_memory = memory.clone();
         for segment in &segments {
             let loaded_address = segment.address;
             // __PAGEZERO reserves an inaccessible range; allocating its often
             // multi-gigabyte size in the sparse guest map would be disastrous.
             if segment.memory_size == 0 || (segment.file_size == 0 && segment.initial_protection == 0) { continue; }
-            memory.map_zeroed(loaded_address, segment.memory_size)?;
+            staged_memory.map_zeroed(loaded_address, segment.memory_size)?;
             if segment.file_size != 0 {
                 let start = usize::try_from(segment.file_offset).map_err(|_| MachOError::InvalidSegmentRange)?;
                 let file_end = segment.file_offset.checked_add(segment.file_size).ok_or(MachOError::InvalidSegmentRange)?;
                 let finish = usize::try_from(file_end).map_err(|_| MachOError::InvalidSegmentRange)?;
-                memory.write(loaded_address, &image_bytes[start..finish])?;
+                staged_memory.write(loaded_address, &image_bytes[start..finish])?;
             }
         }
         if let Some(payload) = chained_fixups.as_deref() {
             let image_base = text_base.checked_sub(slide).ok_or(MachOError::AddressOverflow)?;
-            apply_chained_rebases(payload, &segments, image_base, slide, memory)?;
+            apply_chained_rebases(payload, &segments, image_base, slide, &mut staged_memory)?;
         }
         if let Some(legacy) = classic_dyld_info.as_ref() {
             if !legacy.rebases.is_empty() && chained_fixups.is_some() { return Err(MachOError::InvalidChainedFixups); }
-            apply_classic_rebases(&legacy.rebases, &segments, slide, memory)?;
+            apply_classic_rebases(&legacy.rebases, &segments, slide, &mut staged_memory)?;
         }
 
+        *memory = staged_memory;
         Ok(Self { segments, entry_point, dynamic_libraries, dependencies, rpaths, chained_fixups, classic_dyld_info, exports_trie, text_base, end_address })
     }
 }
