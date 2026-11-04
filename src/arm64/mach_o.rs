@@ -118,7 +118,8 @@ impl MachOImage {
                     if segname == "__TEXT" && text_index.replace(segments.len()).is_some() {
                         return Err(MachOError::DuplicateTextSegment);
                     }
-                    segments.push(Segment { name: segname.clone(), address, memory_size, file_offset, file_size, initial_protection: *initprot as u32 });
+                    let loaded_address = address.checked_add(slide).ok_or(MachOError::AddressOverflow)?;
+                    segments.push(Segment { name: segname.clone(), address: loaded_address, memory_size, file_offset, file_size, initial_protection: *initprot as u32 });
                 }
                 LoadCommand::EntryPoint { entryoff, .. } => {
                     if entry_offset.replace(*entryoff).is_some() { return Err(MachOError::MissingEntryPoint); }
@@ -132,18 +133,18 @@ impl MachOImage {
 
         let text = segments.get(text_index.ok_or(MachOError::MissingTextSegment)?)
             .ok_or(MachOError::MissingTextSegment)?;
-        let text_base = text.address.checked_add(slide).ok_or(MachOError::AddressOverflow)?;
-        let entry_point = resolve_main_entry(text, entry_offset.ok_or(MachOError::MissingEntryPoint)?, slide)?;
+        let text_base = text.address;
+        let entry_point = resolve_main_entry(text, entry_offset.ok_or(MachOError::MissingEntryPoint)?, 0)?;
 
         // Validate all address ranges before mutating guest memory.
         let mut end_address = 0;
         for segment in &segments {
-            let start = segment.address.checked_add(slide).ok_or(MachOError::AddressOverflow)?;
+            let start = segment.address;
             let end = start.checked_add(segment.memory_size).ok_or(MachOError::AddressOverflow)?;
             end_address = end_address.max(end);
         }
         for segment in &segments {
-            let loaded_address = segment.address.checked_add(slide).ok_or(MachOError::AddressOverflow)?;
+            let loaded_address = segment.address;
             // __PAGEZERO reserves an inaccessible range; allocating its often
             // multi-gigabyte size in the sparse guest map would be disastrous.
             if segment.memory_size == 0 || (segment.file_size == 0 && segment.initial_protection == 0) { continue; }
