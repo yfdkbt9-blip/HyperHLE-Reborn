@@ -427,6 +427,26 @@ where
     }
 }
 
+/// Return the lowest non-empty ARM64 VM address in a Mach-O image before sliding.
+pub fn preferred_base(bytes: &[u8]) -> Result<GuestAddr, MachOError> {
+    let image_bytes = choose_arm64_slice(bytes)?;
+    let (header, commands) = match OFile::parse(&mut Cursor::new(image_bytes)).map_err(|_| MachOError::Parse)? {
+        OFile::MachFile { header, commands } => (header, commands),
+        OFile::FatFile { .. } => return Err(MachOError::Parse),
+    };
+    if header.cputype != CPU_TYPE_ARM64 || !header.is_64bit() { return Err(MachOError::WrongArchitecture); }
+    let mut base = None;
+    for MachCommand(command, _) in &commands {
+        if let LoadCommand::Segment64 { vmaddr, vmsize, .. } = command {
+            if *vmsize != 0 {
+                let address = u64::try_from(*vmaddr).map_err(|_| MachOError::InvalidSegmentRange)?;
+                base = Some(base.map_or(address, |current: u64| current.min(address)));
+            }
+        }
+    }
+    base.ok_or(MachOError::MissingTextSegment)
+}
+
 impl MachOImage {
     /// Decode the image's exported symbols, if it contains an export trie.
     pub fn exported_symbols(
