@@ -875,6 +875,29 @@ mod tests {
     }
 
     #[test]
+    fn registry_bind_application_is_atomic_across_chained_and_classic_streams() {
+        let (mut image, mut memory) = bind_test_image();
+        memory.write(0x1_0000_0000, &(1u64 << 63).to_le_bytes()).unwrap();
+        image.classic_dyld_info = Some(ClassicDyldInfo {
+            rebases: vec![],
+            binds: vec![0x40, b'x', 0, 0x90], // bind without a selected segment
+            weak_binds: vec![],
+            lazy_binds: vec![],
+        });
+        let mut registry = super::super::dyld::DylibRegistry::new();
+        let importer = registry.register_image("/App", true).unwrap();
+        registry.add_export(importer, "sym", 0x1234).unwrap();
+
+        assert!(matches!(
+            apply_chained_binds_with_registry(&image, &mut memory, &registry, importer),
+            Err(MachOError::InvalidChainedFixups)
+        ));
+        let mut actual = [0u8; 8];
+        memory.read(0x1_0000_0000, &mut actual).unwrap();
+        assert_eq!(u64::from_le_bytes(actual), 1u64 << 63);
+    }
+
+    #[test]
     fn applies_chained_bind_using_resolved_symbol_address() {
         let (image, mut memory) = bind_test_image();
         memory.write(0x1_0000_0000, &(1u64 << 63).to_le_bytes()).unwrap();
