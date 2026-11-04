@@ -219,6 +219,65 @@ enum RegistryExport {
     Reexport { library_ordinal: u64, imported_name: String },
 }
 
+/// Normalize a POSIX guest path without consulting the host filesystem.
+fn normalize_guest_path(path: &str) -> String {
+    let absolute = path.starts_with('/');
+    let mut parts: Vec<&str> = Vec::new();
+    for part in path.split('/') {
+        match part {
+            "" | "." => {}
+            ".." => { if !parts.is_empty() && parts.last() != Some(&"..") { parts.pop(); } else if !absolute { parts.push(".."); } }
+            value => parts.push(value),
+        }
+    }
+    let joined = parts.join("/");
+    if absolute { format!("/{}", joined) } else if joined.is_empty() { ".".into() } else { joined }
+}
+fn guest_dirname(path: &str) -> &str {
+    match path.rfind('/') { Some(0) => "/", Some(index) => &path[..index], None => "." }
+}
+fn join_guest_path(base: &str, suffix: &str) -> String {
+    normalize_guest_path(&format!("{}/{}", base.trim_end_matches('/'), suffix.trim_start_matches('/')))
+}
+fn expand_rpath(path: &str, loader_path: &str, executable_path: &str) -> Option<String> {
+    if let Some(rest) = path.strip_prefix("@loader_path/") {
+        Some(join_guest_path(guest_dirname(loader_path), rest))
+    } else if let Some(rest) = path.strip_prefix("@executable_path/") {
+        Some(join_guest_path(executable_path, rest))
+    } else if path.starts_with("@rpath/") { None }
+    else if path.starts_with('/') { Some(normalize_guest_path(path)) }
+    else { Some(join_guest_path(guest_dirname(loader_path), path)) }
+}
+
+/// Ordered candidate bundle paths for a Mach-O dependency; runpaths are nearest-loader first.
+pub fn resolve_dylib_candidates(install_name: &str, loader_path: &str, executable_path: &str, runpaths: &[String]) -> Vec<String> {
+    let mut candidates = Vec::new();
+    if let Some(rest) = install_name.strip_prefix("@loader_path/") {
+        candidates.push(join_guest_path(guest_dirname(loader_path), rest));
+    } else if let Some(rest) = install_name.strip_prefix("@executable_path/") {
+        candidates.push(join_guest_path(executable_path, rest));
+    } else if let Some(rest) = install_name.strip_prefix("@rpath/") {
+        for rpath in runpaths { candidates.push(join_guest_path(rpath, rest)); }
+    } else if install_name.starts_with('/') { candidates.push(normalize_guest_path(install_name)); }
+    else { candidates.push(join_guest_path(guest_dirname(loader_path), install_name)); }
+
+    // Versioned macOS framework layout is a fallback; unversioned iOS layout stays first.
+    let original = candidates.clone();
+    for candidate in original {
+        if let Some(marker) = candidate.find(".framework/") {
+            let bundle_end = marker + ".framework".len();
+            let binary = candidate[bundle_end + 1..].rsplit('/').next().unwrap_or("");
+            if !binary.is_empty() {
+                let versioned = format!("{}/Versions/Current/{}", &candidate[..bundle_end], binary);
+                candidates.push(versioned);
+            }
+        }
+    }
+    let mut seen = std::collections::HashSet::new();
+    candidates.retain(|candidate| seen.insert(candidate.clone()));
+    candidates
+}
+
 /// Per-image dependency ordinals and globally loaded dylib exports.
 /// Ordinals are interpreted in the importing image's load-command order.
 #[derive(Clone, Debug, Default)]
@@ -439,63 +498,70 @@ impl DylibRegistry {
         Ok(id)
     }
 
-    /// Recursively load all required and available weak dependencies.
-    /// The resolver maps an install name to file bytes; returning None means
-    /// the file is absent. Weak dependencies keep their ordinal slot, while
-    /// missing required/re-export dependencies abort the operation.
-    pub fn load_dependency_graph<F>(
-        root_install_name: impl Into<String>,
-        root_image: &super::mach_o::MachOImage,
-        memory: &mut super::memory::GuestMemory,
-        mut resolve_file: F,
-    ) -> Result<Self, DylibRegistryError>
-    where
-        F: FnMut(&str) -> Result<Option<Vec<u8>>, String>,
+    /// Compatibility entry point. Root path is also used as executable path.
+    pub fn load_dependency_graph<F>(root_install_name: impl Into<String>, root_image: &super::mach_o::MachOImage, memory: &mut super::memory::GuestMemory, resolve_file: F) -> Result<Self, DylibRegistryError>
+    where F: FnMut(&str) -> Result<Option<Vec<u8>>, String>,
     {
-        fn visit<F>(
-            registry: &mut DylibRegistry,
-            install_name: String,
-            image: super::mach_o::MachOImage,
-            memory: &mut super::memory::GuestMemory,
-            resolve_file: &mut F,
-            is_main: bool,
-        ) -> Result<usize, DylibRegistryError>
-        where
-            F: FnMut(&str) -> Result<Option<Vec<u8>>, String>,
+        let root_path = root_install_name.into();
+        Self::load_dependency_graph_with_paths(root_path.clone(), root_path, root_image, memory, resolve_file)
+    }
+
+    /// Recursively load dependencies using Darwin path tokens. The resolver receives candidate bundle paths in search order.
+    pub fn load_dependency_graph_with_paths<F>(root_install_name: impl Into<String>, root_path: impl Into<String>, root_image: &super::mach_o::MachOImage, memory: &mut super::memory::GuestMemory, mut resolve_file: F) -> Result<Self, DylibRegistryError>
+    where F: FnMut(&str) -> Result<Option<Vec<u8>>, String>,
+    {
+        fn visit<F>(registry: &mut DylibRegistry, install_name: String, image_path: String, image: super::mach_o::MachOImage, executable_path: &str, inherited_rpaths: &[String], memory: &mut super::memory::GuestMemory, resolve_file: &mut F, is_main: bool) -> Result<usize, DylibRegistryError>
+        where F: FnMut(&str) -> Result<Option<Vec<u8>>, String>,
         {
-            if let Some(id) = registry.install_names.get(&install_name) {
-                return Ok(*id);
-            }
+            if let Some(id) = registry.install_names.get(&install_name) { return Ok(*id); }
             let id = registry.register_macho_image(install_name.clone(), &image, is_main)?;
-            // Mark the image as present before descending: dependency cycles
-            // then resolve to the already registered image instead of recursing forever.
             registry.images[id].image = Some(image.clone());
+
+            let mut runpaths = Vec::new();
+            for raw in &image.rpaths {
+                if let Some(expanded) = expand_rpath(raw, &image_path, executable_path) {
+                    if !runpaths.contains(&expanded) { runpaths.push(expanded); }
+                }
+            }
+            for inherited in inherited_rpaths {
+                if !runpaths.contains(inherited) { runpaths.push(inherited.clone()); }
+            }
+
             let mut linked = Vec::with_capacity(image.dependencies.len());
             for dependency in &image.dependencies {
                 if let Some(existing) = registry.install_names.get(&dependency.install_name).copied() {
                     linked.push(Some(existing));
                     continue;
                 }
-                let bytes = match resolve_file(&dependency.install_name)
-                    .map_err(DylibRegistryError::DependencyLoadFailed)? {
-                    Some(bytes) => bytes,
-                    None if dependency.kind == super::mach_o::DylibDependencyKind::Weak => {
-                        linked.push(None);
-                        continue;
+                let candidates = resolve_dylib_candidates(&dependency.install_name, &image_path, executable_path, &runpaths);
+                let mut found = None;
+                let mut resolved_path = None;
+                for candidate in candidates {
+                    match resolve_file(&candidate).map_err(DylibRegistryError::DependencyLoadFailed)? {
+                        Some(bytes) => { found = Some(bytes); resolved_path = Some(candidate); break; }
+                        None => {}
                     }
+                }
+                let bytes = match found {
+                    Some(bytes) => bytes,
+                    None if dependency.kind == super::mach_o::DylibDependencyKind::Weak => { linked.push(None); continue; }
                     None => return Err(DylibRegistryError::MissingRequiredDependency(dependency.install_name.clone())),
                 };
-                let child = super::mach_o::MachOImage::load(&bytes, &mut *memory, 0)
-                    .map_err(|_| DylibRegistryError::DependencyParseFailed(dependency.install_name.clone()))?;
-                let child_id = visit(registry, dependency.install_name.clone(), child, memory, resolve_file, false)?;
+                let child_path = resolved_path.ok_or_else(|| DylibRegistryError::DependencyLoadFailed(dependency.install_name.clone()))?;
+                let child = super::mach_o::MachOImage::load(&bytes, memory, 0)
+                    .map_err(|_| DylibRegistryError::DependencyParseFailed(child_path.clone()))?;
+                let child_id = visit(registry, dependency.install_name.clone(), child_path, child, executable_path, &runpaths, memory, resolve_file, false)?;
                 linked.push(Some(child_id));
             }
             registry.dependencies.insert(id, linked);
             Ok(id)
         }
 
+        let root_install_name = root_install_name.into();
+        let root_path = normalize_guest_path(&root_path.into());
+        let executable_path = guest_dirname(&root_path).to_owned();
         let mut registry = Self::new();
-        visit(&mut registry, root_install_name.into(), root_image.clone(), memory, &mut resolve_file, true)?;
+        visit(&mut registry, root_install_name, root_path, root_image.clone(), &executable_path, &[], memory, &mut resolve_file, true)?;
         Ok(registry)
     }
 
@@ -748,7 +814,7 @@ mod tests {
             segments: vec![],
             entry_point: 0,
             dynamic_libraries: vec![],
-            dependencies: vec![],
+            dependencies: vec![], rpaths: vec![],
             chained_fixups: None,
             // Root edge "_foo" -> terminal exporting text-relative address 0x1234.
             exports_trie: Some(vec![0, 1, b'_', b'f', b'o', b'o', 0, 8, 2, 0, 0xB4, 0x24, 0]),
