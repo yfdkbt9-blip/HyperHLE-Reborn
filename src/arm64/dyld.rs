@@ -1052,6 +1052,21 @@ mod tests {
     }
 
     #[test]
+    fn classic_sleb_decodes_signed_boundaries_and_rejects_overflow() {
+        let mut cursor = 0;
+        assert_eq!(classic_sleb(&[0x7f], &mut cursor), Ok(-1));
+        let min = [0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x7f];
+        cursor = 0;
+        assert_eq!(classic_sleb(&min, &mut cursor), Ok(i64::MIN));
+        let max = [0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x00];
+        cursor = 0;
+        assert_eq!(classic_sleb(&max, &mut cursor), Ok(i64::MAX));
+        let overflow = [0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x01];
+        cursor = 0;
+        assert_eq!(classic_sleb(&overflow, &mut cursor), Err(ClassicOpcodeError::InvalidSleb));
+    }
+
+    #[test]
     fn classic_bind_parser_rejects_truncated_uleb_and_missing_segment() {
         assert_eq!(classic_uleb(&[0x80], &mut 0usize), Err(ClassicOpcodeError::Truncated));
         assert_eq!(parse_classic_binds(&[0x40, b'x', 0, 0x90], false, false),
