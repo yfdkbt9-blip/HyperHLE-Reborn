@@ -92,3 +92,33 @@ pub fn set_integer_return(context: &mut CpuContext, low: u64, high: Option<u64>)
 pub fn set_float_return(context: &mut CpuContext, bits: u64) {
     context.v[0][0] = bits;
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use super::super::memory::PAGE_SIZE;
+
+    #[test]
+    fn integer_arguments_use_x0_to_x7_then_stack() {
+        let mut memory = GuestMemory::new();
+        memory.map_zeroed(0x1_0000_0000, PAGE_SIZE as u64).unwrap();
+        memory.write(0x1_0000_0000, &0xfeed_face_cafe_beefu64.to_le_bytes()).unwrap();
+        let mut context = CpuContext::default();
+        context.x = [10, 11, 12, 13, 14, 15, 16, 17, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        context.sp = 0x1_0000_0000;
+        let mut args = IntegerArguments::new(&context, &memory);
+        for expected in 10..=17 { assert_eq!(args.next_u64().unwrap(), expected); }
+        assert_eq!(args.next_u64().unwrap(), 0xfeed_face_cafe_beef);
+    }
+
+    #[test]
+    fn floating_arguments_use_independent_v_register_bank() {
+        let mut context = CpuContext::default();
+        context.x[0] = 123;
+        context.v[0][0] = 1.5f64.to_bits();
+        context.v[1][0] = 2.5f64.to_bits();
+        let mut args = FloatingArguments::new(&context);
+        assert_eq!(args.next_f64(), Some(1.5));
+        assert_eq!(args.next_f64(), Some(2.5));
+    }
+}
