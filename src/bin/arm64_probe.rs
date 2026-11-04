@@ -19,8 +19,10 @@ use touchHLE::arm64::stack::{apply_initial_stack, build_initial_stack};
 fn read_bundle_executable(path: &Path) -> Result<(Vec<u8>, String), String> {
     if path.is_dir() {
         let info_path = path.join("Info.plist");
-        let info = plist::Value::from_file(&info_path)
+        let info_bytes = std::fs::read(&info_path)
             .map_err(|error| format!("cannot read {}: {error}", info_path.display()))?;
+        let info = plist::Value::from_reader(info_bytes.as_slice())
+            .map_err(|error| format!("cannot parse {}: {error}", info_path.display()))?;
         let executable = info.as_dictionary()
             .and_then(|dictionary| dictionary.get("CFBundleExecutable"))
             .and_then(plist::Value::as_string)
@@ -56,9 +58,10 @@ fn read_bundle_executable(path: &Path) -> Result<(Vec<u8>, String), String> {
         let app_prefix = info_name.strip_suffix("Info.plist").ok_or("invalid app path")?;
         let executable_path = format!("{app_prefix}{executable}");
         let mut bytes = Vec::new();
-        archive.by_name(&executable_path).map_err(|error| {
+        let mut executable_file = archive.by_name(&executable_path).map_err(|error| {
             format!("cannot find app executable {executable_path}: {error}")
-        })?.read_to_end(&mut bytes).map_err(|error| error.to_string())?;
+        })?;
+        executable_file.read_to_end(&mut bytes).map_err(|error| error.to_string())?;
         return Ok((bytes, executable.to_owned()));
     }
 
