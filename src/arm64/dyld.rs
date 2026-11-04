@@ -415,4 +415,46 @@ mod tests {
         assert_eq!(parse_export_trie(&trie), Err(ExportTrieError::InvalidTerminal));
     }
 
+    #[test]
+    fn dylib_registry_resolves_self_and_dependency_ordinals() {
+        let mut registry = DylibRegistry::new();
+        let main = registry.register_image("/App", true).unwrap();
+        let framework = registry.register_image("/System/Library/F.framework/F", false).unwrap();
+        let helper = registry.register_image("/usr/lib/libHelper.dylib", false).unwrap();
+        registry.add_dependency(main, framework).unwrap();
+        registry.add_dependency(main, helper).unwrap();
+        registry.add_export(main, "_entry", 0x1000).unwrap();
+        registry.add_export(framework, "_draw", 0x2000).unwrap();
+        registry.add_export(helper, "_util", 0x3000).unwrap();
+
+        let self_import = ChainedImport { library_ordinal: 0, weak: false, symbol: "_entry".into(), addend: 0 };
+        let framework_import = ChainedImport { library_ordinal: 1, weak: false, symbol: "_draw".into(), addend: 0 };
+        let helper_import = ChainedImport { library_ordinal: 2, weak: false, symbol: "_util".into(), addend: 0 };
+        assert_eq!(registry.resolve(main, &self_import).unwrap(), Some(0x1000));
+        assert_eq!(registry.resolve(main, &framework_import).unwrap(), Some(0x2000));
+        assert_eq!(registry.resolve(main, &helper_import).unwrap(), Some(0x3000));
+    }
+
+    #[test]
+    fn dylib_registry_supports_main_and_flat_lookup_ordinals() {
+        let mut registry = DylibRegistry::new();
+        let main = registry.register_image("/App", true).unwrap();
+        let library = registry.register_image("/usr/lib/libSystem.B.dylib", false).unwrap();
+        registry.add_dependency(main, library).unwrap();
+        registry.add_export(main, "_main_symbol", 0x1110).unwrap();
+        registry.add_export(library, "_printf", 0x2220).unwrap();
+        let main_import = ChainedImport { library_ordinal: -1, weak: false, symbol: "_main_symbol".into(), addend: 0 };
+        let flat_import = ChainedImport { library_ordinal: -2, weak: false, symbol: "_printf".into(), addend: 0 };
+        assert_eq!(registry.resolve(library, &main_import).unwrap(), Some(0x1110));
+        assert_eq!(registry.resolve(main, &flat_import).unwrap(), Some(0x2220));
+    }
+
+    #[test]
+    fn dylib_registry_rejects_invalid_dependency_ordinals() {
+        let mut registry = DylibRegistry::new();
+        let app = registry.register_image("/App", true).unwrap();
+        let missing = ChainedImport { library_ordinal: 1, weak: false, symbol: "_missing".into(), addend: 0 };
+        assert_eq!(registry.resolve(app, &missing), Err(DylibRegistryError::InvalidOrdinal(1)));
+    }
+
 }
