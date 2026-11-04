@@ -366,10 +366,16 @@ pub fn apply_chained_binds_with_registry(
                 .map_err(MachOError::DylibRegistry)?;
         }
     }
-    apply_chained_binds(image, memory, |import| {
+    // Apply both fixup encodings to a private snapshot. A malformed legacy
+    // stream or unresolved classic import must not leave chained binds visible
+    // in guest memory (and vice versa).
+    let mut staged_memory = memory.clone();
+    apply_chained_binds(image, &mut staged_memory, |import| {
         registry.resolve(importer_id, import).ok().flatten()
     })?;
-    apply_classic_binds_with_registry(image, memory, registry, importer_id)
+    apply_classic_binds_with_registry(image, &mut staged_memory, registry, importer_id)?;
+    *memory = staged_memory;
+    Ok(())
 }
 
 pub fn apply_chained_binds<F>(
