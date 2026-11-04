@@ -761,4 +761,29 @@ mod tests {
         assert_eq!(registry.resolve(id, &import).unwrap(), Some(0x1_0000_1234));
     }
 
+    #[test]
+    fn dependency_graph_registers_root_image_without_external_dependencies() {
+        let root = super::super::mach_o::MachOImage {
+            segments: vec![],
+            entry_point: 0,
+            dynamic_libraries: vec![],
+            dependencies: vec![],
+            chained_fixups: None,
+            exports_trie: None,
+            text_base: 0x1_0000_0000,
+            end_address: 0,
+        };
+        let mut memory = super::super::memory::GuestMemory::new();
+        let registry = DylibRegistry::load_dependency_graph(
+            "/App",
+            &root,
+            &mut memory,
+            |_install_name| -> Result<Option<Vec<u8>>, String> {
+                panic!("resolver must not be called for an image without dependencies")
+            },
+        ).unwrap();
+        assert_eq!(registry.image_count(), 1);
+        assert!(registry.image(0).unwrap().image.is_some());
+    }
+
 }
