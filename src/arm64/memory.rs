@@ -133,6 +133,9 @@ impl GuestMemory {
     pub fn write(&mut self, address: GuestAddr, input: &[u8]) -> Result<(), MemoryError> {
         let size = u64::try_from(input.len()).map_err(|_| MemoryError::AddressOverflow)?;
         let end = address.checked_add(size).ok_or(MemoryError::AddressOverflow)?;
+        if !self.is_mapped(address, size) {
+            return Err(MemoryError::Unmapped { address });
+        }
         let mut current = address;
         let mut consumed = 0usize;
         while current < end {
