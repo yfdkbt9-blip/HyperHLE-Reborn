@@ -129,6 +129,33 @@ mod tests {
     }
 
     #[test]
+    fn parses_import_addend_formats() {
+        let mut addend32=vec![0u8;42];
+        addend32[8..12].copy_from_slice(&28u32.to_le_bytes());
+        addend32[12..16].copy_from_slice(&36u32.to_le_bytes());
+        addend32[16..20].copy_from_slice(&1u32.to_le_bytes());
+        addend32[20..24].copy_from_slice(&2u32.to_le_bytes());
+        addend32[28..32].copy_from_slice(&(2u32 | (1u32<<8) | (1u32<<9)).to_le_bytes());
+        addend32[32..36].copy_from_slice(&(-7i32).to_le_bytes());
+        addend32[36..].copy_from_slice(b"_foo\0");
+        let got=parse_chained_imports(&addend32).unwrap();
+        assert_eq!(got[0],ChainedImport{library_ordinal:2,weak:true,symbol:"_foo".into(),addend:-7});
+
+        let mut addend64=vec![0u8;45];
+        addend64[8..12].copy_from_slice(&28u32.to_le_bytes());
+        addend64[12..16].copy_from_slice(&44u32.to_le_bytes());
+        addend64[16..20].copy_from_slice(&1u32.to_le_bytes());
+        addend64[20..24].copy_from_slice(&3u32.to_le_bytes());
+        let import_word=3u64 | (1u64<<16) | (1u64<<32);
+        addend64[28..36].copy_from_slice(&import_word.to_le_bytes());
+        addend64[36..44].copy_from_slice(&(-0x1234i64).to_le_bytes());
+        addend64[44]=0;
+        // A zero-length name is valid at the end of the symbol pool.
+        let got=parse_chained_imports(&addend64).unwrap();
+        assert_eq!(got[0],ChainedImport{library_ordinal:3,weak:true,symbol:String::new(),addend:-0x1234});
+    }
+
+    #[test]
     fn rejects_compressed_symbol_pool_without_decompressor() {
         let mut payload=vec![0u8;28];
         payload[24..28].copy_from_slice(&1u32.to_le_bytes());
