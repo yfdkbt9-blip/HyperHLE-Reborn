@@ -3,6 +3,7 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/.
  */
+#include <array>
 #include <cstdint>
 #include <cstdio>
 #include "dynarmic/interface/A64/a64.h"
@@ -12,11 +13,11 @@
 namespace touchHLE::arm64 {
 using VAddr = std::uint64_t;
 using Vector = Dynarmic::A64::Vector;
+struct touchHLE_A64Memory;
 extern "C" {
 bool touchHLE_a64_read(touchHLE_A64Memory*, VAddr, std::uint8_t*, std::size_t);
 bool touchHLE_a64_write(touchHLE_A64Memory*, VAddr, const std::uint8_t*, std::size_t);
 }
-struct touchHLE_A64Memory;
 struct Context {
   std::uint64_t x[31]{};
   std::uint64_t sp = 0;
