@@ -307,7 +307,7 @@ impl MachOImage {
             }
         }
         if let Some(payload) = chained_fixups.as_deref() {
-            let image_base = segments.iter().filter(|s| s.memory_size != 0).map(|s| s.address).min().ok_or(MachOError::MissingTextSegment)?;
+            let image_base = text_base.checked_sub(slide).ok_or(MachOError::AddressOverflow)?;
             apply_chained_rebases(payload, &segments, image_base, slide, memory)?;
         }
         Ok(Self { segments, entry_point, dynamic_libraries, chained_fixups, text_base, end_address })
