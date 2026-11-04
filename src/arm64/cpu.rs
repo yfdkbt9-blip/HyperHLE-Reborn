@@ -40,11 +40,26 @@ impl<'a> Cpu<'a> {
         Self { raw, memory }
     }
 
-    /// Access guest memory between JIT runs (for loading, SVC dispatch, and debugging).\n    pub fn memory_mut(&mut self) -> &mut GuestMemory { self.memory }\n\n    pub fn set_context(&mut self, context: &CpuContext) {
+    /// Access guest memory between JIT runs (for loading, SVC dispatch, and debugging).
+    pub fn memory_mut(&mut self) -> &mut GuestMemory { self.memory }
+
+    pub fn set_context(&mut self, context: &CpuContext) {
         unsafe { touchHLE_A64_set_context(self.raw, context); }
     }
 
-    /// Apply one stopped SVC to the current guest context, then restore it to the JIT.\n    pub fn dispatch_svc(\n        &mut self,\n        immediate: u16,\n        dispatcher: &mut super::svc::SvcDispatcher,\n    ) -> Result<bool, String> {\n        let mut context = self.get_context();\n        let handled = dispatcher.dispatch(immediate, &mut context, self.memory)?;\n        if handled { self.set_context(&context); }\n        Ok(handled)\n    }\n\n    pub fn get_context(&self) -> CpuContext {
+    /// Apply one stopped SVC to the current guest context, then restore it to the JIT.
+    pub fn dispatch_svc(
+        &mut self,
+        immediate: u16,
+        dispatcher: &mut super::svc::SvcDispatcher,
+    ) -> Result<bool, String> {
+        let mut context = self.get_context();
+        let handled = dispatcher.dispatch(immediate, &mut context, self.memory)?;
+        if handled { self.set_context(&context); }
+        Ok(handled)
+    }
+
+    pub fn get_context(&self) -> CpuContext {
         let mut context = CpuContext::default();
         unsafe { touchHLE_A64_get_context(self.raw, &mut context); }
         context
