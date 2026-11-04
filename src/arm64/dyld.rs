@@ -598,6 +598,17 @@ impl DylibRegistry {
         Ok(registry)
     }
 
+    /// Apply all chained binds after the complete dependency graph has been
+    /// registered. This ordering is required for cross-dylib symbol resolution.
+    pub fn apply_all_chained_binds(&self, memory: &mut super::memory::GuestMemory) -> Result<(), super::mach_o::MachOError> {
+        for (image_id, loaded) in self.images.iter().enumerate() {
+            if let Some(image) = loaded.image.as_ref() {
+                super::mach_o::apply_chained_binds_with_registry(image, memory, self, image_id)?;
+            }
+        }
+        Ok(())
+    }
+
     pub fn image_count(&self) -> usize { self.images.len() }
 }
 
