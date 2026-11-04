@@ -294,4 +294,39 @@ mod tests {
         assert_eq!(&bytes[..4], &encode_svc(7).to_le_bytes());
         assert_eq!(&bytes[4..], &A64_RET_X30.to_le_bytes());
     }
+
+    #[test]
+    fn parses_regular_export_trie_symbol() {
+        // Root edge "_foo" points to a terminal node exporting address 0x1234.
+        let trie = [0, 1, b'_', b'f', b'o', b'o', 0, 8, 2, 0, 0xB4, 0x24, 0];
+        let exports = parse_export_trie(&trie).unwrap();
+        assert_eq!(exports, vec![ExportedSymbol {
+            name: "_foo".into(), flags: 0, kind: ExportKind::Regular { address: 0x1234 }
+        }]);
+    }
+
+    #[test]
+    fn parses_reexport_trie_symbol() {
+        // Terminal payload: flags(REEXPORT), ordinal 2, imported name "_bar".
+        let trie = [8, 0x08, 2, b'_', b'b', b'a', b'r', 0, 0];
+        let exports = parse_export_trie(&trie).unwrap();
+        assert_eq!(exports[0].kind, ExportKind::Reexport {
+            library_ordinal: 2, imported_name: "_bar".into()
+        });
+    }
+
+    #[test]
+    fn rejects_export_trie_cycles_and_bad_child_offsets() {
+        let cycle = [0, 1, b'a', 0, 0];
+        assert_eq!(parse_export_trie(&cycle), Err(ExportTrieError::Cycle));
+        let bad_child = [0, 1, b'a', 0, 0x7f];
+        assert_eq!(parse_export_trie(&bad_child), Err(ExportTrieError::ChildOutOfRange));
+    }
+
+    #[test]
+    fn rejects_truncated_export_terminal() {
+        let trie = [2, 0, 1];
+        assert_eq!(parse_export_trie(&trie), Err(ExportTrieError::InvalidTerminal));
+    }
+
 }
