@@ -30,17 +30,17 @@ pub enum StopReason {
 
 pub struct Cpu<'a> {
     raw: *mut std::ffi::c_void,
-    _memory: std::marker::PhantomData<&'a mut GuestMemory>,
+    memory: &'a mut GuestMemory,
 }
 
 impl<'a> Cpu<'a> {
     pub fn new(memory: &'a mut GuestMemory) -> Self {
         let raw = unsafe { touchHLE_A64_new((memory as *mut GuestMemory).cast()) };
         assert!(!raw.is_null(), "Dynarmic A64 failed to create CPU");
-        Self { raw, _memory: std::marker::PhantomData }
+        Self { raw, memory }
     }
 
-    pub fn set_context(&mut self, context: &CpuContext) {
+    /// Access guest memory between JIT runs (for loading, SVC dispatch, and debugging).\n    pub fn memory_mut(&mut self) -> &mut GuestMemory { self.memory }\n\n    pub fn set_context(&mut self, context: &CpuContext) {
         unsafe { touchHLE_A64_set_context(self.raw, context); }
     }
 
