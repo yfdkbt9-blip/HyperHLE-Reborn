@@ -33,7 +33,7 @@ pub struct MachOImage {
 pub enum MachOError {
     Parse, WrongArchitecture, UnsupportedSubtype, MissingTextSegment,
     DuplicateTextSegment, MissingEntryPoint, EntryPointOutsideText,
-    InvalidSegmentRange, AddressOverflow, Memory(MemoryError),
+    InvalidSegmentRange, OverlappingSegments, AddressOverflow, Memory(MemoryError),
 }
 impl From<MemoryError> for MachOError {
     fn from(value: MemoryError) -> Self { Self::Memory(value) }
@@ -136,12 +136,24 @@ impl MachOImage {
         let text_base = text.address;
         let entry_point = resolve_main_entry(text, entry_offset.ok_or(MachOError::MissingEntryPoint)?, 0)?;
 
-        // Validate all address ranges before mutating guest memory.
+        // Validate all address ranges and reject overlapping VM segments before
+        // mutating guest memory. Silently merging two segment mappings would
+        // hide malformed images and can overwrite another segment's contents.
+        let mut ranges = Vec::with_capacity(segments.len());
         let mut end_address = 0;
         for segment in &segments {
             let start = segment.address;
             let end = start.checked_add(segment.memory_size).ok_or(MachOError::AddressOverflow)?;
+            if segment.memory_size != 0 {
+                ranges.push((start, end));
+            }
             end_address = end_address.max(end);
+        }
+        ranges.sort_unstable_by_key(|range| range.0);
+        for pair in ranges.windows(2) {
+            if pair[1].0 < pair[0].1 {
+                return Err(MachOError::OverlappingSegments);
+            }
         }
         for segment in &segments {
             let loaded_address = segment.address;
