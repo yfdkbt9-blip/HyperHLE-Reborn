@@ -402,33 +402,34 @@ impl DylibRegistry {
     ) -> Result<usize, DylibRegistryError> {
         let exports = image.exported_symbols()
             .map_err(|_| DylibRegistryError::InvalidExportTrie)?;
-        let id = self.register_image(install_name, is_main)?;
+        // Validate and materialize the complete export table before mutating
+        // the registry, so malformed exports cannot leave a half-registered image.
+        let mut staged = Vec::with_capacity(exports.len());
         for export in exports {
-            match export.kind {
+            let entry = match export.kind {
                 ExportKind::Regular { address } => {
-                    let kind = export.flags & 0x03;
-                    let resolved = match kind {
+                    let resolved = match export.flags & 0x03 {
                         0 => image.text_base.checked_add(address)
                             .ok_or(DylibRegistryError::AddressOverflow)?,
                         2 => address,
                         _ => return Err(DylibRegistryError::UnsupportedExportKind),
                     };
-                    if export.flags & 0x04 != 0 {
-                        self.add_weak_export(id, export.name, resolved)?;
-                    } else {
-                        self.add_export(id, export.name, resolved)?;
-                    }
+                    let weak = export.flags & 0x04 != 0;
+                    RegistryExport::Address { address: resolved, weak_definition: weak }
                 }
                 ExportKind::StubAndResolver { stub, .. } => {
                     let address = image.text_base.checked_add(stub)
                         .ok_or(DylibRegistryError::AddressOverflow)?;
-                    self.add_export(id, export.name, address)?;
+                    RegistryExport::Address { address, weak_definition: export.flags & 0x04 != 0 }
                 }
                 ExportKind::Reexport { library_ordinal, imported_name } => {
-                    self.add_reexport(id, export.name, library_ordinal, imported_name)?;
+                    RegistryExport::Reexport { library_ordinal, imported_name }
                 }
-            }
+            };
+            staged.push((export.name, entry));
         }
+        let id = self.register_image(install_name, is_main)?;
+        self.images[id].exports.extend(staged);
         Ok(id)
     }
 
