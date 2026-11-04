@@ -209,7 +209,13 @@ pub fn parse_export_trie(data: &[u8]) -> Result<Vec<ExportedSymbol>, ExportTrieE
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LoadedDylib {
     pub install_name: String,
-    pub exports: std::collections::HashMap<String, GuestAddr>,
+    exports: std::collections::HashMap<String, RegistryExport>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum RegistryExport {
+    Address(GuestAddr),
+    Reexport { library_ordinal: u64, imported_name: String },
 }
 
 /// Per-image dependency ordinals and globally loaded dylib exports.
@@ -227,6 +233,9 @@ pub enum DylibRegistryError {
     InvalidDependencyId,
     DuplicateInstallName,
     InvalidOrdinal(i16),
+    InvalidReexportOrdinal(u64),
+    ReexportCycle,
+    ReexportDepthExceeded,
 }
 
 impl DylibRegistry {
@@ -252,14 +261,58 @@ impl DylibRegistry {
 
     pub fn add_export(&mut self, image: usize, name: impl Into<String>, address: GuestAddr) -> Result<(), DylibRegistryError> {
         let image = self.images.get_mut(image).ok_or(DylibRegistryError::InvalidImageId)?;
-        image.exports.insert(name.into(), address);
+        image.exports.insert(name.into(), RegistryExport::Address(address));
+        Ok(())
+    }
+
+    pub fn add_reexport(
+        &mut self,
+        image: usize,
+        name: impl Into<String>,
+        library_ordinal: u64,
+        imported_name: impl Into<String>,
+    ) -> Result<(), DylibRegistryError> {
+        let image = self.images.get_mut(image).ok_or(DylibRegistryError::InvalidImageId)?;
+        image.exports.insert(name.into(), RegistryExport::Reexport {
+            library_ordinal,
+            imported_name: imported_name.into(),
+        });
         Ok(())
     }
 
     pub fn image(&self, id: usize) -> Option<&LoadedDylib> { self.images.get(id) }
 
-    fn find_in(&self, image: usize, name: &str) -> Option<GuestAddr> {
-        self.images.get(image)?.exports.get(name).copied()
+    fn resolve_in(
+        &self,
+        image_id: usize,
+        name: &str,
+        active: &mut std::collections::HashSet<(usize, String)>,
+        depth: usize,
+    ) -> Result<Option<GuestAddr>, DylibRegistryError> {
+        if depth > 128 { return Err(DylibRegistryError::ReexportDepthExceeded); }
+        let key = (image_id, name.to_owned());
+        if !active.insert(key.clone()) { return Err(DylibRegistryError::ReexportCycle); }
+        let result = match self.images.get(image_id).and_then(|image| image.exports.get(name)) {
+            None => Ok(None),
+            Some(RegistryExport::Address(address)) => Ok(Some(*address)),
+            Some(RegistryExport::Reexport { library_ordinal, imported_name }) => {
+                let dependencies = self.dependencies.get(&image_id).ok_or(
+                    DylibRegistryError::InvalidReexportOrdinal(*library_ordinal)
+                )?;
+                let dependency_id = library_ordinal.checked_sub(1)
+                    .and_then(|index| usize::try_from(index).ok())
+                    .and_then(|index| dependencies.get(index).copied())
+                    .ok_or(DylibRegistryError::InvalidReexportOrdinal(*library_ordinal))?;
+                let forwarded_name = if imported_name.is_empty() { name } else { imported_name.as_str() };
+                self.resolve_in(dependency_id, forwarded_name, active, depth + 1)
+            }
+        };
+        active.remove(&key);
+        result
+    }
+
+    fn find_in(&self, image: usize, name: &str) -> Result<Option<GuestAddr>, DylibRegistryError> {
+        self.resolve_in(image, name, &mut std::collections::HashSet::new(), 0)
     }
 
     /// Resolve an import using its signed Mach-O library ordinal.
@@ -269,11 +322,14 @@ impl DylibRegistry {
         if importer >= self.images.len() { return Err(DylibRegistryError::InvalidImageId); }
         let ordinal = import.library_ordinal;
         match ordinal {
-            0 => Ok(self.find_in(importer, &import.symbol)),
-            -1 => Ok(self.main_executable.and_then(|id| self.find_in(id, &import.symbol))),
+            0 => self.find_in(importer, &import.symbol),
+            -1 => match self.main_executable {
+                Some(id) => self.find_in(id, &import.symbol),
+                None => Ok(None),
+            },
             -2 | -3 => {
-                for (id, image) in self.images.iter().enumerate() {
-                    if let Some(address) = image.exports.get(&import.symbol) { return Ok(Some(*address)); }
+                for id in 0..self.images.len() {
+                    if let Some(address) = self.find_in(id, &import.symbol)? { return Ok(Some(address)); }
                 }
                 Ok(None)
             }
@@ -281,7 +337,7 @@ impl DylibRegistry {
                 let dependencies = self.dependencies.get(&importer).ok_or(DylibRegistryError::InvalidOrdinal(value))?;
                 let dependency = dependencies.get((value - 1) as usize)
                     .ok_or(DylibRegistryError::InvalidOrdinal(value))?;
-                Ok(self.find_in(*dependency, &import.symbol))
+                self.find_in(*dependency, &import.symbol)
             }
             value => Err(DylibRegistryError::InvalidOrdinal(value)),
         }
