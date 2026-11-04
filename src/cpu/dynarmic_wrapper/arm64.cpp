@@ -69,7 +69,7 @@ private:
   void fault() { reason=StopReason::Memory; jit->HaltExecution(Dynarmic::HaltReason::MemoryAbort); }
   template<typename T> bool exclusive(VAddr a,T v,T expected) { T old{}; if(!read(a,&old,sizeof(old))) { fault(); return false; } if(old!=expected) return false; return write(a,&v,sizeof(v)); }
 };
-struct Wrapper { Callbacks callbacks; Dynarmic::A64::Jit jit; Wrapper(touchHLE_A64Memory* mem):callbacks(mem),jit([&]{ Dynarmic::A64::UserConfig c{&callbacks}; c.enable_cycle_counting=true; return c;}()) { callbacks.jit=&jit; } };
+struct Wrapper { Callbacks callbacks; Dynarmic::A64::Jit jit; Wrapper(touchHLE_A64Memory* mem):callbacks(mem),jit([&]{ Dynarmic::A64::UserConfig c{&callbacks}; c.enable_cycle_counting=true; c.check_halt_on_memory_access=true; return c;}()) { callbacks.jit=&jit; } };
 }
 extern "C" {
 void* touchHLE_A64_new(void* mem) { return new touchHLE::arm64::Wrapper(static_cast<touchHLE::arm64::touchHLE_A64Memory*>(mem)); }
