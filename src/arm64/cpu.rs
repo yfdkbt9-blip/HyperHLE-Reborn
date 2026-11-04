@@ -44,7 +44,7 @@ impl<'a> Cpu<'a> {
         unsafe { touchHLE_A64_set_context(self.raw, context); }
     }
 
-    pub fn get_context(&self) -> CpuContext {
+    /// Apply one stopped SVC to the current guest context, then restore it to the JIT.\n    pub fn dispatch_svc(\n        &mut self,\n        immediate: u16,\n        dispatcher: &mut super::svc::SvcDispatcher,\n    ) -> Result<bool, String> {\n        let mut context = self.get_context();\n        let handled = dispatcher.dispatch(immediate, &mut context, self.memory)?;\n        if handled { self.set_context(&context); }\n        Ok(handled)\n    }\n\n    pub fn get_context(&self) -> CpuContext {
         let mut context = CpuContext::default();
         unsafe { touchHLE_A64_get_context(self.raw, &mut context); }
         context
