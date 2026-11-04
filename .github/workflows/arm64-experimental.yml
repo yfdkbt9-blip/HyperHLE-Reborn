@@ -52,3 +52,6 @@ jobs:
 
       - name: Build ARM64 host target
         run: cargo build --target aarch64-apple-darwin --release
+
+      - name: Compile the standalone ARM64 entry-point probe
+        run: cargo check --target aarch64-apple-darwin --features arm64-probe --bin arm64-probe
