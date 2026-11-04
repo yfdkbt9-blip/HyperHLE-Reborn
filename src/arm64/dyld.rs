@@ -10,6 +10,7 @@
 
 use super::memory::{GuestAddr, GuestMemory, MemoryError};
 use std::convert::TryInto;
+use std::io::Read;
 
 
 /// One imported symbol described by an LC_DYLD_CHAINED_FIXUPS import table.
