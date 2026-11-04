@@ -824,7 +824,7 @@ mod tests {
         payload[56..58].copy_from_slice(&1u16.to_le_bytes());
         payload[60..64].copy_from_slice(&0u32.to_le_bytes());
         payload[64..68].copy_from_slice(&7i32.to_le_bytes());
-        payload[68..72].copy_from_slice(b"sym\\0");
+        payload[68..72].copy_from_slice(b"sym\0");
         image.chained_fixups = Some(payload);
         let raw = (1u64 << 63) | (5u64 << 24);
         memory.write(0x1_0000_0000, &raw.to_le_bytes()).unwrap();
@@ -846,6 +846,21 @@ mod tests {
         let mut bytes = [0u8; 8];
         memory.read(0x1_0000_0000, &mut bytes).unwrap();
         assert_eq!(u64::from_le_bytes(bytes), 0xA003);
+    }
+
+    #[test]
+    fn arm64e_userland24_authenticated_bind_resolves_without_pac() {
+        let (mut image, mut memory) = bind_test_image();
+        let mut payload = image.chained_fixups.take().unwrap();
+        payload[42..44].copy_from_slice(&12u16.to_le_bytes());
+        image.chained_fixups = Some(payload);
+        // Authenticated bind: ordinal 0; metadata is ignored by unsigned-pointer emulation.
+        let raw = (1u64 << 63) | (1u64 << 62) | (0xBEEFu64 << 32) | (1u64 << 48);
+        memory.write(0x1_0000_0000, &raw.to_le_bytes()).unwrap();
+        apply_chained_binds(&image, &mut memory, |_| Some(0xA000)).unwrap();
+        let mut bytes = [0u8; 8];
+        memory.read(0x1_0000_0000, &mut bytes).unwrap();
+        assert_eq!(u64::from_le_bytes(bytes), 0xA000);
     }
 
     #[test]
