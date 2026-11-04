@@ -1025,4 +1025,37 @@ mod tests {
         assert_eq!(expand_rpath("@rpath/Other", "/App/P", "/App"), None);
     }
 
+    #[test]
+    fn classic_rebase_opcode_stream_decodes_pointer_slots() {
+        let stream = [0x11, 0x20, 0x10, 0x52, 0x00];
+        assert_eq!(parse_classic_rebases(&stream).unwrap(), vec![
+            ClassicRebase { segment_index: 0, segment_offset: 0x10 },
+            ClassicRebase { segment_index: 0, segment_offset: 0x18 },
+        ]);
+    }
+
+    #[test]
+    fn classic_bind_opcode_stream_decodes_import_and_slot() {
+        let stream = [0x11, 0x40, b'_', b'f', b'o', b'o', 0, 0x51, 0x70, 0x02, 0x00, 0x90, 0x00];
+        assert_eq!(parse_classic_binds(&stream, false, false).unwrap(), vec![
+            ClassicBind { segment_index: 2, segment_offset: 0, library_ordinal: 1,
+                symbol: "_foo".into(), weak_import: false, addend: 0 }
+        ]);
+    }
+
+    #[test]
+    fn classic_weak_bind_uses_implicit_weak_lookup_ordinal() {
+        let stream = [0x40, b'_', b'w', b'e', b'a', b'k', 0, 0x51, 0x70, 0x01, 0x00, 0x90, 0x00];
+        let binds = parse_classic_binds(&stream, true, false).unwrap();
+        assert_eq!(binds[0].library_ordinal, -3);
+        assert_eq!(binds[0].symbol, "_weak");
+    }
+
+    #[test]
+    fn classic_bind_parser_rejects_truncated_uleb_and_missing_segment() {
+        assert_eq!(classic_uleb(&[0x80], &mut 0usize), Err(ClassicOpcodeError::Truncated));
+        assert_eq!(parse_classic_binds(&[0x40, b'x', 0, 0x90], false, false),
+            Err(ClassicOpcodeError::MissingSegment));
+    }
+
 }
