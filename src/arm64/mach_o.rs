@@ -186,6 +186,26 @@ fn validate_chained_fixups(data: &[u8]) -> Result<(), MachOError> {
     Ok(())
 }
 
+/// Decode a page's chain starts, including its START_MULTI overflow list.
+fn chained_page_starts(payload: &[u8], info: usize, info_size: usize, page_count: usize, value: u16) -> Result<Vec<u16>, MachOError> {
+    if value == 0xFFFF { return Ok(Vec::new()); }
+    if value & 0x8000 == 0 { return Ok(vec![value]); }
+    let mut index = usize::from(value & 0x7FFF);
+    let capacity = info_size.checked_sub(22).ok_or(MachOError::InvalidChainedFixups)? / 2;
+    if index < page_count || index >= capacity { return Err(MachOError::InvalidChainedFixups); }
+    let mut starts = Vec::new();
+    loop {
+        if index >= capacity || starts.len() >= capacity { return Err(MachOError::InvalidChainedFixups); }
+        let at = info.checked_add(22).and_then(|v| v.checked_add(index.checked_mul(2)?)).ok_or(MachOError::InvalidChainedFixups)?;
+        let end = at.checked_add(2).ok_or(MachOError::InvalidChainedFixups)?;
+        let raw = u16::from_le_bytes(payload.get(at..end).ok_or(MachOError::InvalidChainedFixups)?.try_into().map_err(|_| MachOError::InvalidChainedFixups)?);
+        starts.push(raw & 0x7FFF);
+        if raw & 0x8000 != 0 { break; }
+        index = index.checked_add(1).ok_or(MachOError::InvalidChainedFixups)?;
+    }
+    Ok(starts)
+}
+
 /// Apply rebases for DYLD_CHAINED_PTR_64_OFFSET (generic arm64 format).
 /// Bind pointers and arm64e/PAC formats are intentionally rejected.
 fn apply_chained_rebases(payload: &[u8], segments: &[Segment], image_base: GuestAddr, slide: GuestAddr, memory: &mut GuestMemory) -> Result<(), MachOError> {
@@ -213,12 +233,13 @@ fn apply_chained_rebases(payload: &[u8], segments: &[Segment], image_base: Guest
         if seg_off!=expected { return Err(MachOError::InvalidChainedFixups); }
         for page in 0..pages {
             let start=u16_at(payload,info+22+page*2)?;
-            if start==START_NONE { continue; }
-            if start & START_MULTI != 0 { return Err(MachOError::UnsupportedPointerFormat); }
+            let starts_for_page=chained_page_starts(payload,info,size,pages,start)?;
+            if starts_for_page.is_empty() { continue; }
             let seg_end=seg.address.checked_add(seg.memory_size).ok_or(MachOError::AddressOverflow)?;
             let page_base=seg.address.checked_add((page as u64).checked_mul(page_size).ok_or(MachOError::InvalidChainedFixups)?).ok_or(MachOError::AddressOverflow)?;
             let page_end=page_base.checked_add(page_size).ok_or(MachOError::AddressOverflow)?.min(seg_end);
-            let mut loc=page_base.checked_add(u64::from(start)).ok_or(MachOError::AddressOverflow)?;
+            for chain_start in starts_for_page {
+            let mut loc=page_base.checked_add(u64::from(chain_start)).ok_or(MachOError::AddressOverflow)?;
             loop {
                 if loc.checked_add(8).ok_or(MachOError::AddressOverflow)?>page_end { return Err(MachOError::InvalidChainedFixups); }
                 let mut bytes=[0u8;8]; memory.read(loc,&mut bytes)?;
@@ -233,6 +254,7 @@ fn apply_chained_rebases(payload: &[u8], segments: &[Segment], image_base: Guest
                 let next=(raw>>51)&0xFFF;
                 if next==0 { break; }
                 loc=loc.checked_add(next*4).ok_or(MachOError::AddressOverflow)?;
+            }
             }
         }
     }
@@ -332,17 +354,16 @@ where
             .ok_or(MachOError::AddressOverflow)?;
         for page_index in 0..page_count {
             let page_start = u16_at(payload, info + 22 + page_index * 2)?;
-            if page_start == 0xFFFF { continue; }
-            if page_start & 0x8000 != 0 {
-                return Err(MachOError::UnsupportedPointerFormat);
-            }
+            let starts_for_page = chained_page_starts(payload, info, info_size, page_count, page_start)?;
+            if starts_for_page.is_empty() { continue; }
             let page_base = segment.address.checked_add(
                 (page_index as u64).checked_mul(page_size)
                     .ok_or(MachOError::AddressOverflow)?
             ).ok_or(MachOError::AddressOverflow)?;
             let page_end = page_base.checked_add(page_size)
                 .ok_or(MachOError::AddressOverflow)?.min(segment_end);
-            let mut location = page_base.checked_add(u64::from(page_start))
+            for chain_start in starts_for_page {
+            let mut location = page_base.checked_add(u64::from(chain_start))
                 .ok_or(MachOError::AddressOverflow)?;
             loop {
                 if location.checked_add(8).ok_or(MachOError::AddressOverflow)? > page_end {
@@ -382,6 +403,7 @@ where
                 location = location.checked_add(next.checked_mul(4)
                     .ok_or(MachOError::AddressOverflow)?)
                     .ok_or(MachOError::AddressOverflow)?;
+            }
             }
         }
     }
