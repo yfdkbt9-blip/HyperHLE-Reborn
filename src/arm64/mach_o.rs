@@ -454,8 +454,9 @@ where
                             let inline_addend = ((raw >> 24) & 0xFF) as u8;
                             let embedded_reserved = (raw >> 32) & 0x7_FFFF;
                             if embedded_reserved != 0 { return Err(MachOError::InvalidChainedFixups); }
-                            // Generic 64-bit inline addend replaces the import addend.
-                            (ordinal, if inline_addend != 0 { Some(i64::from(inline_addend)) } else { None })
+                            // The generic 64-bit inline addend is unsigned and
+                            // augments the import-table addend.
+                            (ordinal, Some(i64::from(inline_addend)))
                         };
                         let import = imports.get(ordinal).ok_or(MachOError::InvalidImportOrdinal)?;
                         let symbol = match resolve(import) {
@@ -463,12 +464,8 @@ where
                             None if import.weak => 0,
                             None => return Err(MachOError::UnresolvedStrongImport(import.symbol.clone())),
                         };
-                        let total_addend = if is_arm64e {
-                            import.addend.checked_add(embedded_addend.unwrap_or(0))
-                                .ok_or(MachOError::BindAddendOverflow)?
-                        } else {
-                            embedded_addend.unwrap_or(import.addend)
-                        };
+                        let total_addend = import.addend.checked_add(embedded_addend.unwrap_or(0))
+                            .ok_or(MachOError::BindAddendOverflow)?;
                         // Authenticated binds are emitted as unsigned guest pointers.
                         // PAC key/diversity/address-diversity metadata is not emulated.
                         let value = add_signed(symbol, total_addend)?;
@@ -807,6 +804,48 @@ mod tests {
         let mut actual = [0u8; 8];
         memory.read(0x1_0000_0000, &mut actual).unwrap();
         assert_eq!(u64::from_le_bytes(actual), 0x1_2345_6780);
+    }
+
+    #[test]
+    fn generic_chained_bind_adds_inline_and_import_addends() {
+        let (mut image, mut memory) = bind_test_image();
+        let mut payload = vec![0u8; 72];
+        payload[4..8].copy_from_slice(&28u32.to_le_bytes());
+        payload[8..12].copy_from_slice(&60u32.to_le_bytes());
+        payload[12..16].copy_from_slice(&68u32.to_le_bytes());
+        payload[16..20].copy_from_slice(&1u32.to_le_bytes());
+        payload[20..24].copy_from_slice(&2u32.to_le_bytes()); // IMPORT_ADDEND
+        payload[24..28].copy_from_slice(&0u32.to_le_bytes());
+        payload[28..32].copy_from_slice(&1u32.to_le_bytes());
+        payload[32..36].copy_from_slice(&8u32.to_le_bytes());
+        payload[36..40].copy_from_slice(&24u32.to_le_bytes());
+        payload[40..42].copy_from_slice(&0x1000u16.to_le_bytes());
+        payload[42..44].copy_from_slice(&6u16.to_le_bytes());
+        payload[56..58].copy_from_slice(&1u16.to_le_bytes());
+        payload[60..64].copy_from_slice(&0u32.to_le_bytes());
+        payload[64..68].copy_from_slice(&7i32.to_le_bytes());
+        payload[68..72].copy_from_slice(b"sym\\0");
+        image.chained_fixups = Some(payload);
+        let raw = (1u64 << 63) | (5u64 << 24);
+        memory.write(0x1_0000_0000, &raw.to_le_bytes()).unwrap();
+        apply_chained_binds(&image, &mut memory, |_| Some(0x9000)).unwrap();
+        let mut bytes = [0u8; 8];
+        memory.read(0x1_0000_0000, &mut bytes).unwrap();
+        assert_eq!(u64::from_le_bytes(bytes), 0x900C);
+    }
+
+    #[test]
+    fn arm64e_userland24_bind_decodes_24_bit_ordinal_and_addend() {
+        let (mut image, mut memory) = bind_test_image();
+        let mut payload = image.chained_fixups.take().unwrap();
+        payload[42..44].copy_from_slice(&12u16.to_le_bytes());
+        image.chained_fixups = Some(payload);
+        let raw = (1u64 << 62) | (3u64 << 32); // bind, ordinal 0, embedded addend 3
+        memory.write(0x1_0000_0000, &raw.to_le_bytes()).unwrap();
+        apply_chained_binds(&image, &mut memory, |_| Some(0xA000)).unwrap();
+        let mut bytes = [0u8; 8];
+        memory.read(0x1_0000_0000, &mut bytes).unwrap();
+        assert_eq!(u64::from_le_bytes(bytes), 0xA003);
     }
 
     #[test]
