@@ -38,7 +38,7 @@ pub struct DylibDependency {
 }
 
 #[derive(Clone, Debug)]
-pub struct MachOImage {
+pub struct ClassicDyldInfo {\n    pub rebases: Vec<u8>, pub binds: Vec<u8>, pub weak_binds: Vec<u8>, pub lazy_binds: Vec<u8>,\n}\n\n#[derive(Clone, Debug)]\npub struct MachOImage {
     pub segments: Vec<Segment>,
     pub entry_point: GuestAddr,
     /// Ordered install names retained for compatibility with earlier callers.
@@ -48,7 +48,7 @@ pub struct MachOImage {
     /// Ordered LC_RPATH entries used to resolve @rpath dependencies.
     pub rpaths: Vec<String>,
     /// Raw LC_DYLD_CHAINED_FIXUPS payload. Parsed separately by the A64 dyld layer.
-    pub chained_fixups: Option<Vec<u8>>,
+    pub chained_fixups: Option<Vec<u8>>,\n    /// Legacy LC_DYLD_INFO opcode streams, if present.\n    pub classic_dyld_info: Option<ClassicDyldInfo>,
     /// Raw LC_DYLD_EXPORTS_TRIE payload, decoded by the A64 dyld layer.
     pub exports_trie: Option<Vec<u8>>,
     pub text_base: GuestAddr,
@@ -303,6 +303,45 @@ fn apply_chained_rebases(payload: &[u8], segments: &[Segment], image_base: Guest
 /// address of an imported symbol. Writes are staged so a missing strong symbol
 /// or malformed chain cannot leave guest memory half-patched.
 /// Apply binds using the shared A64 dylib registry and this image's ID.
+
+/// Apply legacy pointer rebases after validating and staging every patch.
+pub fn apply_classic_rebases(data:&[u8],segments:&[Segment],slide:u64,memory:&mut GuestMemory)->Result<(),MachOError>{
+    let records=super::dyld::parse_classic_rebases(data).map_err(|_|MachOError::InvalidChainedFixups)?;
+    let mut patches=Vec::with_capacity(records.len());
+    for record in records {
+        let seg=segments.get(record.segment_index).ok_or(MachOError::InvalidSegmentRange)?;
+        let address=seg.address.checked_add(record.segment_offset).ok_or(MachOError::AddressOverflow)?;
+        if record.segment_offset.checked_add(8).filter(|end|*end<=seg.memory_size).is_none(){return Err(MachOError::InvalidSegmentRange);}
+        let mut bytes=[0u8;8];memory.read(address,&mut bytes)?;
+        let value=u64::from_le_bytes(bytes).checked_add(slide).ok_or(MachOError::AddressOverflow)?;
+        patches.push((address,value.to_le_bytes()));
+    }
+    for (address,bytes) in patches {memory.write(address,&bytes)?;}
+    Ok(())
+}
+
+/// Resolve and apply classic regular/weak/lazy binds using the shared dylib registry.
+pub fn apply_classic_binds_with_registry(image:&MachOImage,memory:&mut GuestMemory,registry:&super::dyld::DylibRegistry,importer_id:usize)->Result<(),MachOError>{
+    let legacy=match image.classic_dyld_info.as_ref(){Some(v)=>v,None=>return Ok(())};
+    let mut records=Vec::new();
+    for (stream,weak,lazy) in [(&legacy.binds,false,false),(&legacy.weak_binds,true,false),(&legacy.lazy_binds,false,true)] {
+        records.extend(super::dyld::parse_classic_binds(stream,weak,lazy).map_err(|_|MachOError::InvalidChainedFixups)?);
+    }
+    let mut patches=Vec::with_capacity(records.len());
+    for record in records {
+        let seg=image.segments.get(record.segment_index).ok_or(MachOError::InvalidSegmentRange)?;
+        if record.segment_offset.checked_add(8).filter(|end|*end<=seg.memory_size).is_none(){return Err(MachOError::InvalidSegmentRange);}
+        let address=seg.address.checked_add(record.segment_offset).ok_or(MachOError::AddressOverflow)?;
+        let import=super::dyld::ChainedImport{library_ordinal:record.library_ordinal,weak:record.weak_import,symbol:record.symbol.clone(),addend:record.addend};
+        let resolved=registry.resolve(importer_id,&import).map_err(MachOError::DylibRegistry)?;
+        let symbol=match resolved {Some(v)=>v,None if record.weak_import=>0,None=>return Err(MachOError::UnresolvedStrongImport(record.symbol))};
+        let value=if record.addend>=0{symbol.checked_add(record.addend as u64)}else{symbol.checked_sub(record.addend.unsigned_abs())}.ok_or(MachOError::BindAddendOverflow)?;
+        patches.push((address,value.to_le_bytes()));
+    }
+    for (address,bytes) in patches {memory.write(address,&bytes)?;}
+    Ok(())
+}
+
 pub fn apply_chained_binds_with_registry(
     image: &MachOImage,
     memory: &mut GuestMemory,
@@ -571,7 +610,7 @@ impl MachOImage {
         let mut dynamic_libraries = Vec::new();
         let mut dependencies = Vec::new();
         let mut rpaths = Vec::new();
-        let mut chained_fixups = None;
+        let mut chained_fixups = None;\n        let mut classic_dyld_info = None;
         let mut exports_trie = None;
         for MachCommand(command, _) in &commands {
             match command {
@@ -612,15 +651,27 @@ impl MachOImage {
                         .map_err(|_| MachOError::InvalidExportsTrie)?;
                     exports_trie = Some(payload.to_vec());
                 }
-                LoadCommand::DyldInfo { export_off, export_size, .. } if *export_size != 0 => {
-                    if exports_trie.is_some() { return Err(MachOError::ConflictingExportsTrieCommands); }
-                    let start = usize::try_from(*export_off).map_err(|_| MachOError::InvalidSegmentRange)?;
-                    let size = usize::try_from(*export_size).map_err(|_| MachOError::InvalidSegmentRange)?;
-                    let finish = start.checked_add(size).ok_or(MachOError::InvalidSegmentRange)?;
-                    let payload = image_bytes.get(start..finish).ok_or(MachOError::InvalidSegmentRange)?;
-                    super::dyld::parse_export_trie(payload)
-                        .map_err(|_| MachOError::InvalidExportsTrie)?;
-                    exports_trie = Some(payload.to_vec());
+                LoadCommand::DyldInfo { rebase_off, rebase_size, bind_off, bind_size,
+                    weak_bind_off, weak_bind_size, lazy_bind_off, lazy_bind_size, export_off, export_size } => {
+                    fn stream(bytes: &[u8], offset: u32, size: u32) -> Result<Vec<u8>, MachOError> {
+                        if size == 0 { return Ok(Vec::new()); }
+                        let start=usize::try_from(offset).map_err(|_|MachOError::InvalidSegmentRange)?;
+                        let len=usize::try_from(size).map_err(|_|MachOError::InvalidSegmentRange)?;
+                        let end=start.checked_add(len).ok_or(MachOError::InvalidSegmentRange)?;
+                        Ok(bytes.get(start..end).ok_or(MachOError::InvalidSegmentRange)?.to_vec())
+                    }
+                    if classic_dyld_info.is_some() { return Err(MachOError::InvalidSegmentRange); }
+                    let rebases=stream(image_bytes,*rebase_off,*rebase_size)?;
+                    let binds=stream(image_bytes,*bind_off,*bind_size)?;
+                    let weak_binds=stream(image_bytes,*weak_bind_off,*weak_bind_size)?;
+                    let lazy_binds=stream(image_bytes,*lazy_bind_off,*lazy_bind_size)?;
+                    if *export_size != 0 {
+                        if exports_trie.is_some() { return Err(MachOError::ConflictingExportsTrieCommands); }
+                        let payload=stream(image_bytes,*export_off,*export_size)?;
+                        super::dyld::parse_export_trie(&payload).map_err(|_|MachOError::InvalidExportsTrie)?;
+                        exports_trie=Some(payload);
+                    }
+                    classic_dyld_info=Some(ClassicDyldInfo{rebases,binds,weak_binds,lazy_binds});
                 }
                 LoadCommand::LoadDyLib(dylib) => {
                     let name = dylib.name.to_string();
@@ -701,7 +752,12 @@ impl MachOImage {
             let image_base = text_base.checked_sub(slide).ok_or(MachOError::AddressOverflow)?;
             apply_chained_rebases(payload, &segments, image_base, slide, memory)?;
         }
-        Ok(Self { segments, entry_point, dynamic_libraries, dependencies, rpaths, chained_fixups, exports_trie, text_base, end_address })
+        if let Some(legacy) = classic_dyld_info.as_ref() {
+            if !legacy.rebases.is_empty() && chained_fixups.is_some() { return Err(MachOError::InvalidChainedFixups); }
+            apply_classic_rebases(&legacy.rebases, &segments, slide, memory)?;
+        }
+
+        Ok(Self { segments, entry_point, dynamic_libraries, dependencies, rpaths, chained_fixups, classic_dyld_info, exports_trie, text_base, end_address })
     }
 }
 
@@ -785,7 +841,7 @@ mod tests {
         };
         let image = MachOImage {
             segments: vec![segment], entry_point: 0, dynamic_libraries: vec![], dependencies: vec![], rpaths: vec![],
-            chained_fixups: Some(payload), exports_trie: None,
+            chained_fixups: Some(payload), classic_dyld_info: None, exports_trie: None,
             text_base: 0x1_0000_0000, end_address: 0x1_0000_1000,
         };
         let mut memory = GuestMemory::new();
