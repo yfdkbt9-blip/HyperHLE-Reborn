@@ -93,6 +93,7 @@ extern "C" fn touchHLE_a64_read(
 ) -> bool {
     if memory.is_null() || (output.is_null() && size != 0) { return false; }
     let memory = unsafe { &*(memory.cast::<GuestMemory>()) };
+    if size == 0 { return true; }
     let output = unsafe { std::slice::from_raw_parts_mut(output, size) };
     memory.read(address, output).is_ok()
 }
@@ -106,6 +107,7 @@ extern "C" fn touchHLE_a64_write(
 ) -> bool {
     if memory.is_null() || (input.is_null() && size != 0) { return false; }
     let memory = unsafe { &mut *(memory.cast::<GuestMemory>()) };
+    if size == 0 { return true; }
     let input = unsafe { std::slice::from_raw_parts(input, size) };
     memory.write(address, input).is_ok()
 }
