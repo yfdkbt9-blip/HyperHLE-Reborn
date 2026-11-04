@@ -676,4 +676,23 @@ mod tests {
         assert_eq!(registry.resolve(app, &weak_lookup).unwrap(), Some(0x2000));
     }
 
+    #[test]
+    fn registers_exports_from_a_macho_export_trie() {
+        let image = super::super::mach_o::MachOImage {
+            segments: vec![],
+            entry_point: 0,
+            dynamic_libraries: vec![],
+            dependencies: vec![],
+            chained_fixups: None,
+            // Root edge "_foo" -> terminal exporting text-relative address 0x1234.
+            exports_trie: Some(vec![0, 1, b'_', b'f', b'o', b'o', 0, 8, 2, 0, 0xB4, 0x24, 0]),
+            text_base: 0x1_0000_0000,
+            end_address: 0,
+        };
+        let mut registry = DylibRegistry::new();
+        let id = registry.register_macho_image("/App", &image, true).unwrap();
+        let import = ChainedImport { library_ordinal: 0, weak: false, symbol: "_foo".into(), addend: 0 };
+        assert_eq!(registry.resolve(id, &import).unwrap(), Some(0x1_0000_1234));
+    }
+
 }
