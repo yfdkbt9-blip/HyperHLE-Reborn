@@ -513,4 +513,31 @@ mod tests {
         assert_eq!(registry.resolve(app, &missing), Err(DylibRegistryError::InvalidOrdinal(1)));
     }
 
+    #[test]
+    fn dylib_registry_resolves_reexports_through_dependency_ordinals() {
+        let mut registry = DylibRegistry::new();
+        let app = registry.register_image("/App", true).unwrap();
+        let umbrella = registry.register_image("/Framework/Umbrella", false).unwrap();
+        let implementation = registry.register_image("/Framework/Implementation", false).unwrap();
+        registry.add_dependency(app, umbrella).unwrap();
+        registry.add_dependency(umbrella, implementation).unwrap();
+        registry.add_reexport(umbrella, "_public_api", 1, "_implementation").unwrap();
+        registry.add_export(implementation, "_implementation", 0x1234_5678).unwrap();
+        let import = ChainedImport { library_ordinal: 1, weak: false, symbol: "_public_api".into(), addend: 0 };
+        assert_eq!(registry.resolve(app, &import).unwrap(), Some(0x1234_5678));
+    }
+
+    #[test]
+    fn dylib_registry_detects_reexport_cycles() {
+        let mut registry = DylibRegistry::new();
+        let first = registry.register_image("/A", true).unwrap();
+        let second = registry.register_image("/B", false).unwrap();
+        registry.add_dependency(first, second).unwrap();
+        registry.add_dependency(second, first).unwrap();
+        registry.add_reexport(first, "_cycle", 1, "_cycle").unwrap();
+        registry.add_reexport(second, "_cycle", 1, "_cycle").unwrap();
+        let import = ChainedImport { library_ordinal: 0, weak: false, symbol: "_cycle".into(), addend: 0 };
+        assert_eq!(registry.resolve(first, &import), Err(DylibRegistryError::ReexportCycle));
+    }
+
 }
