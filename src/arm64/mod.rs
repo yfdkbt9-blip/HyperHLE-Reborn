@@ -11,3 +11,4 @@ pub mod abi;
 pub mod mach_o;
 pub mod dyld;
 pub mod stack;
+pub mod svc;
