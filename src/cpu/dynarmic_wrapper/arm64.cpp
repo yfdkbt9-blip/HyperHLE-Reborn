@@ -72,7 +72,7 @@ private:
 struct Wrapper { Callbacks callbacks; Dynarmic::A64::Jit jit; Wrapper(touchHLE_A64Memory* mem):callbacks(mem),jit([&]{ Dynarmic::A64::UserConfig c{&callbacks}; c.enable_cycle_counting=true; return c;}()) { callbacks.jit=&jit; } };
 }
 extern "C" {
-void* touchHLE_A64_new(void* mem) { return new touchHLE::arm64::Wrapper(static_cast<touchHLE_A64Memory*>(mem)); }
+void* touchHLE_A64_new(void* mem) { return new touchHLE::arm64::Wrapper(static_cast<touchHLE::arm64::touchHLE_A64Memory*>(mem)); }
 void touchHLE_A64_delete(void* p) { delete static_cast<touchHLE::arm64::Wrapper*>(p); }
 void touchHLE_A64_set_context(void* p,const touchHLE::arm64::Context* c) {
  auto& j=static_cast<touchHLE::arm64::Wrapper*>(p)->jit;
