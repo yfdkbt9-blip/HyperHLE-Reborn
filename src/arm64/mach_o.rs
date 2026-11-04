@@ -864,6 +864,35 @@ mod tests {
     }
 
     #[test]
+    fn arm64e_userland_bind_sign_extends_inline_addend_and_sums_import_addend() {
+        let (mut image, mut memory) = bind_test_image();
+        let mut payload = vec![0u8; 72];
+        payload[4..8].copy_from_slice(&28u32.to_le_bytes());
+        payload[8..12].copy_from_slice(&60u32.to_le_bytes());
+        payload[12..16].copy_from_slice(&68u32.to_le_bytes());
+        payload[16..20].copy_from_slice(&1u32.to_le_bytes());
+        payload[20..24].copy_from_slice(&2u32.to_le_bytes()); // IMPORT_ADDEND
+        payload[28..32].copy_from_slice(&1u32.to_le_bytes());
+        payload[32..36].copy_from_slice(&8u32.to_le_bytes());
+        payload[36..40].copy_from_slice(&24u32.to_le_bytes());
+        payload[40..42].copy_from_slice(&0x1000u16.to_le_bytes());
+        payload[42..44].copy_from_slice(&9u16.to_le_bytes()); // ARM64E_USERLAND
+        payload[56..58].copy_from_slice(&1u16.to_le_bytes());
+        payload[60..64].copy_from_slice(&0u32.to_le_bytes());
+        payload[64..68].copy_from_slice(&7i32.to_le_bytes());
+        payload[68..72].copy_from_slice(b"sym\\0");
+        image.chained_fixups = Some(payload);
+
+        // Bind, ordinal 0, embedded signed 19-bit addend -2.
+        let raw = (1u64 << 62) | (0x7_FFFEu64 << 32);
+        memory.write(0x1_0000_0000, &raw.to_le_bytes()).unwrap();
+        apply_chained_binds(&image, &mut memory, |_| Some(0x9000)).unwrap();
+        let mut bytes = [0u8; 8];
+        memory.read(0x1_0000_0000, &mut bytes).unwrap();
+        assert_eq!(u64::from_le_bytes(bytes), 0x9005);
+    }
+
+    #[test]
     fn chained_bind_walk_continues_after_rebase_and_stages_writes() {
         let (image, mut memory) = bind_test_image();
         memory.write(0x1_0000_0000, &(2u64 << 51).to_le_bytes()).unwrap();
