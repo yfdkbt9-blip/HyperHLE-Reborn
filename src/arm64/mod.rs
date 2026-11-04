@@ -7,3 +7,4 @@
 
 pub mod memory;
 \npub mod cpu;\npub mod mach_o;
+pub mod dyld;
