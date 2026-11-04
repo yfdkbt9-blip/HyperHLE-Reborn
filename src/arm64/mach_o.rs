@@ -141,16 +141,20 @@ fn validate_chained_fixups(data: &[u8]) -> Result<(), MachOError> {
     let seg_count = usize::try_from(u32_at(data, starts_offset)?).map_err(|_| MachOError::InvalidChainedFixups)?;
     let offsets_start = starts_offset.checked_add(4).ok_or(MachOError::InvalidChainedFixups)?;
     let offsets = checked_range(offsets_start, seg_count, 4, data.len())?;
+    let minimum_segment_offset = offsets.end.checked_sub(starts_offset).ok_or(MachOError::InvalidChainedFixups)?;
     for index in 0..seg_count {
         let relative = usize::try_from(u32_at(data, offsets.start + index * 4)?)
             .map_err(|_| MachOError::InvalidChainedFixups)?;
         if relative == 0 { continue; }
+        if relative < minimum_segment_offset { return Err(MachOError::InvalidChainedFixups); }
         let segment_start = starts_offset.checked_add(relative).ok_or(MachOError::InvalidChainedFixups)?;
         let size = usize::try_from(u32_at(data, segment_start)?)
             .map_err(|_| MachOError::InvalidChainedFixups)?;
         if size < STARTS_SEGMENT_HEADER_SIZE { return Err(MachOError::InvalidChainedFixups); }
         let segment_end = segment_start.checked_add(size).ok_or(MachOError::InvalidChainedFixups)?;
-        if segment_end > data.len() { return Err(MachOError::InvalidChainedFixups); }
+        if segment_end > data.len() || segment_end > imports_offset {
+            return Err(MachOError::InvalidChainedFixups);
+        }
         let page_count = usize::from(u16_at(data, segment_start + 20)?);
         let page_array_end = STARTS_SEGMENT_HEADER_SIZE.checked_add(page_count.checked_mul(2)
             .ok_or(MachOError::InvalidChainedFixups)?).ok_or(MachOError::InvalidChainedFixups)?;
@@ -258,6 +262,36 @@ mod tests {
     fn text(file_offset: u64, file_size: u64, vmaddr: u64, vmsize: u64) -> Segment {
         Segment { name: "__TEXT".into(), address: vmaddr, memory_size: vmsize, file_offset, file_size, initial_protection: 0x5 }
     }
+    fn minimal_fixups_payload() -> Vec<u8> {
+        let mut data = vec![0u8; 28 + 8 + 22 + 2 + 4];
+        data[4..8].copy_from_slice(&28u32.to_le_bytes()); // starts_offset
+        data[8..12].copy_from_slice(&60u32.to_le_bytes()); // imports_offset
+        data[12..16].copy_from_slice(&60u32.to_le_bytes()); // symbols_offset
+        data[20..24].copy_from_slice(&1u32.to_le_bytes()); // imports_format
+        data[24..28].copy_from_slice(&0u32.to_le_bytes()); // symbols_format
+        data[28..32].copy_from_slice(&1u32.to_le_bytes()); // seg_count
+        data[32..36].copy_from_slice(&8u32.to_le_bytes()); // seg_info_offset[0]
+        data[36..40].copy_from_slice(&24u32.to_le_bytes()); // starts_in_segment.size
+        data[56..58].copy_from_slice(&1u16.to_le_bytes()); // page_count
+        data[60..64].copy_from_slice(&[0, 0, 0, 0]);
+        data
+    }
+
+    #[test]
+    fn chained_fixups_accepts_bounded_minimal_tables() {
+        assert!(validate_chained_fixups(&minimal_fixups_payload()).is_ok());
+    }
+
+    #[test]
+    fn chained_fixups_rejects_unknown_version_and_truncated_segment_table() {
+        let mut data = minimal_fixups_payload();
+        data[0..4].copy_from_slice(&1u32.to_le_bytes());
+        assert!(matches!(validate_chained_fixups(&data), Err(MachOError::InvalidChainedFixups)));
+        let mut data = minimal_fixups_payload();
+        data[56..58].copy_from_slice(&4u16.to_le_bytes());
+        assert!(matches!(validate_chained_fixups(&data), Err(MachOError::InvalidChainedFixups)));
+    }
+
     #[test]
     fn lc_main_resolves_file_offset_and_slide() {
         assert_eq!(resolve_main_entry(&text(0, 0x3000, 0x1_0000_0000, 0x3000), 0x1234, 0x4000).unwrap(), 0x1_0000_5234);
