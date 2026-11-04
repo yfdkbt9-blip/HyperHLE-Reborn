@@ -209,6 +209,7 @@ pub fn parse_export_trie(data: &[u8]) -> Result<Vec<ExportedSymbol>, ExportTrieE
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LoadedDylib {
     pub install_name: String,
+    pub image: Option<super::mach_o::MachOImage>,
     exports: std::collections::HashMap<String, RegistryExport>,
 }
 
@@ -225,6 +226,7 @@ pub struct DylibRegistry {
     images: Vec<LoadedDylib>,
     dependencies: std::collections::HashMap<usize, Vec<Option<usize>>>,
     main_executable: Option<usize>,
+    install_names: std::collections::HashMap<String, usize>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -240,6 +242,8 @@ pub enum DylibRegistryError {
     InvalidExportTrie,
     UnsupportedExportKind,
     AddressOverflow,
+    DependencyLoadFailed(String),
+    DependencyParseFailed(String),
 }
 
 impl DylibRegistry {
@@ -247,11 +251,12 @@ impl DylibRegistry {
 
     pub fn register_image(&mut self, install_name: impl Into<String>, is_main: bool) -> Result<usize, DylibRegistryError> {
         let install_name = install_name.into();
-        if self.images.iter().any(|image| image.install_name == install_name) {
+        if self.install_names.contains_key(&install_name) {
             return Err(DylibRegistryError::DuplicateInstallName);
         }
         let id = self.images.len();
-        self.images.push(LoadedDylib { install_name, exports: std::collections::HashMap::new() });
+        self.install_names.insert(install_name.clone(), id);
+        self.images.push(LoadedDylib { install_name, image: None, exports: std::collections::HashMap::new() });
         if is_main { self.main_executable = Some(id); }
         Ok(id)
     }
@@ -430,7 +435,69 @@ impl DylibRegistry {
         }
         let id = self.register_image(install_name, is_main)?;
         self.images[id].exports.extend(staged);
+        self.images[id].image = Some(image.clone());
         Ok(id)
+    }
+
+    /// Recursively load all required and available weak dependencies.
+    /// The resolver maps an install name to file bytes; returning None means
+    /// the file is absent. Weak dependencies keep their ordinal slot, while
+    /// missing required/re-export dependencies abort the operation.
+    pub fn load_dependency_graph<F>(
+        root_install_name: impl Into<String>,
+        root_image: &super::mach_o::MachOImage,
+        memory: &mut super::memory::GuestMemory,
+        mut resolve_file: F,
+    ) -> Result<Self, DylibRegistryError>
+    where
+        F: FnMut(&str) -> Result<Option<Vec<u8>>, String>,
+    {
+        fn visit<F>(
+            registry: &mut DylibRegistry,
+            install_name: String,
+            image: super::mach_o::MachOImage,
+            memory: &mut super::memory::GuestMemory,
+            resolve_file: &mut F,
+            is_main: bool,
+        ) -> Result<usize, DylibRegistryError>
+        where
+            F: FnMut(&str) -> Result<Option<Vec<u8>>, String>,
+        {
+            if let Some(id) = registry.install_names.get(&install_name) {
+                return Ok(*id);
+            }
+            let id = registry.register_macho_image(install_name.clone(), &image, is_main)?;
+            // Mark the image as present before descending: dependency cycles
+            // then resolve to the already registered image instead of recursing forever.
+            registry.images[id].image = Some(image.clone());
+            let mut linked = Vec::with_capacity(image.dependencies.len());
+            for dependency in &image.dependencies {
+                if let Some(existing) = registry.install_names.get(&dependency.install_name).copied() {
+                    linked.push(Some(existing));
+                    continue;
+                }
+                let bytes = match resolve_file(&dependency.install_name)
+                    .map_err(DylibRegistryError::DependencyLoadFailed)? {
+                    Some(bytes) => bytes,
+                    None if dependency.kind == super::mach_o::DylibDependencyKind::Weak => {
+                        linked.push(None);
+                        continue;
+                    }
+                    None => return Err(DylibRegistryError::MissingRequiredDependency(dependency.install_name.clone())),
+                };
+                let mut child_memory = memory;
+                let child = super::mach_o::MachOImage::load(&bytes, &mut child_memory, 0)
+                    .map_err(|_| DylibRegistryError::DependencyParseFailed(dependency.install_name.clone()))?;
+                let child_id = visit(registry, dependency.install_name.clone(), child, child_memory, resolve_file, false)?;
+                linked.push(Some(child_id));
+            }
+            registry.dependencies.insert(id, linked);
+            Ok(id)
+        }
+
+        let mut registry = Self::new();
+        visit(&mut registry, root_install_name.into(), root_image.clone(), memory, &mut resolve_file, true)?;
+        Ok(registry)
     }
 
     pub fn image_count(&self) -> usize { self.images.len() }
