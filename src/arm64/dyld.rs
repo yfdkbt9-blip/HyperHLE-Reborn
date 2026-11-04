@@ -856,6 +856,21 @@ mod tests {
     }
 
     #[test]
+    fn weak_lookup_does_not_bind_to_strong_only_export() {
+        let mut registry = DylibRegistry::new();
+        let app = registry.register_image("/App", true).unwrap();
+        let strong = registry.register_image("/Strong.dylib", false).unwrap();
+        registry.add_export(strong, "_only_strong", 0xCAFE).unwrap();
+        let import = ChainedImport {
+            library_ordinal: -3,
+            weak: false,
+            symbol: "_only_strong".into(),
+            addend: 0,
+        };
+        assert_eq!(registry.resolve(app, &import).unwrap(), None);
+    }
+
+    #[test]
     fn registers_exports_from_a_macho_export_trie() {
         let image = super::super::mach_o::MachOImage {
             segments: vec![],
