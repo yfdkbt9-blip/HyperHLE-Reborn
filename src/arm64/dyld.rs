@@ -135,7 +135,7 @@ mod tests {
         addend32[12..16].copy_from_slice(&36u32.to_le_bytes());
         addend32[16..20].copy_from_slice(&1u32.to_le_bytes());
         addend32[20..24].copy_from_slice(&2u32.to_le_bytes());
-        addend32[28..32].copy_from_slice(&(2u32 | (1u32<<8) | (1u32<<9)).to_le_bytes());
+        addend32[28..32].copy_from_slice(&(2u32 | (1u32<<8)).to_le_bytes());
         addend32[32..36].copy_from_slice(&(-7i32).to_le_bytes());
         addend32[36..].copy_from_slice(b"_foo\0");
         let got=parse_chained_imports(&addend32).unwrap();
