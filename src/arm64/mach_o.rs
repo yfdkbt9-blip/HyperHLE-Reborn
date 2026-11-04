@@ -228,7 +228,7 @@ fn apply_chained_rebases(payload: &[u8], segments: &[Segment], image_base: Guest
         let format=u16_at(payload,info+6)?;
         let seg_off=u64::from_le_bytes(payload.get(info+8..info+16).ok_or(MachOError::InvalidChainedFixups)?.try_into().map_err(|_|MachOError::InvalidChainedFixups)?);
         let pages=usize::from(u16_at(payload,info+20)?);
-        if format!=6 && format!=9 { return Err(MachOError::UnsupportedPointerFormat); }
+        if format!=6 && format!=9 && format!=12 { return Err(MachOError::UnsupportedPointerFormat); }
         let page_array_size=pages.checked_mul(2).and_then(|v|v.checked_add(22)).ok_or(MachOError::InvalidChainedFixups)?;
         if (page_size!=0x1000 && page_size!=0x4000) || size<page_array_size { return Err(MachOError::InvalidChainedFixups); }
         let expected=seg.address.checked_sub(slide).and_then(|a|a.checked_sub(image_base)).ok_or(MachOError::InvalidChainedFixups)?;
@@ -241,7 +241,7 @@ fn apply_chained_rebases(payload: &[u8], segments: &[Segment], image_base: Guest
             let page_base=seg.address.checked_add((page as u64).checked_mul(page_size).ok_or(MachOError::InvalidChainedFixups)?).ok_or(MachOError::AddressOverflow)?;
             let page_end=page_base.checked_add(page_size).ok_or(MachOError::AddressOverflow)?.min(seg_end);
             for chain_start in starts_for_page {
-            let stride = if format == 9 { 8 } else { 4 };
+            let stride = if format == 6 { 4 } else { 8 };
             if u64::from(chain_start).checked_add(8).ok_or(MachOError::AddressOverflow)? > page_size
                 || u64::from(chain_start) % stride != 0 { return Err(MachOError::InvalidChainedFixups); }
             let mut loc=page_base.checked_add(u64::from(chain_start)).ok_or(MachOError::AddressOverflow)?;
@@ -249,14 +249,15 @@ fn apply_chained_rebases(payload: &[u8], segments: &[Segment], image_base: Guest
                 if loc.checked_add(8).ok_or(MachOError::AddressOverflow)?>page_end { return Err(MachOError::InvalidChainedFixups); }
                 let mut bytes=[0u8;8]; memory.read(loc,&mut bytes)?;
                 let raw=u64::from_le_bytes(bytes);
-                let next = if format == 9 { (raw >> 51) & 0x7FF } else { (raw >> 51) & 0xFFF };
-                let is_bind = if format == 9 {
+                let is_arm64e = format == 9 || format == 12;
+                let next = if is_arm64e { (raw >> 51) & 0x7FF } else { (raw >> 51) & 0xFFF };
+                let is_bind = if is_arm64e {
                     raw & (1u64 << 62) != 0
                 } else {
                     raw & (1u64 << 63) != 0
                 };
-                let authenticated = format == 9 && raw & (1u64 << 63) != 0;
-                if format == 9 {
+                let authenticated = is_arm64e && raw & (1u64 << 63) != 0;
+                if is_arm64e {
                     // Bind pointers are resolved in the later registry-aware pass.
                     if is_bind {
                         // Do not patch this word, but continue following its chain.
@@ -381,7 +382,7 @@ where
                 .try_into().map_err(|_| MachOError::InvalidChainedFixups)?
         );
         let page_count = usize::from(u16_at(payload, info + 20)?);
-        if pointer_format != 6 && pointer_format != 9 {
+        if pointer_format != 6 && pointer_format != 9 && pointer_format != 12 {
             return Err(MachOError::UnsupportedPointerFormat);
         }
         if page_size != 0x1000 && page_size != 0x4000 {
@@ -395,7 +396,7 @@ where
             .ok_or(MachOError::InvalidChainedFixups)?;
         if segment_offset != expected_offset { return Err(MachOError::InvalidChainedFixups); }
 
-        let stride = if pointer_format == 9 { 8u64 } else { 4u64 };
+        let stride = if pointer_format == 6 { 4u64 } else { 8u64 };
         let segment_end = segment.address.checked_add(segment.memory_size)
             .ok_or(MachOError::AddressOverflow)?;
         for page_index in 0..page_count {
@@ -422,17 +423,21 @@ where
                     let mut raw_bytes = [0u8; 8];
                     memory.read(location, &mut raw_bytes)?;
                     let raw = u64::from_le_bytes(raw_bytes);
-                    let (is_bind, authenticated, next) = if pointer_format == 9 {
+                    let is_arm64e = pointer_format == 9 || pointer_format == 12;
+                    let (is_bind, authenticated, next) = if is_arm64e {
                         (raw & (1u64 << 62) != 0, raw & (1u64 << 63) != 0, (raw >> 51) & 0x7FF)
                     } else {
                         (raw & (1u64 << 63) != 0, false, (raw >> 51) & 0xFFF)
                     };
 
                     if is_bind {
-                        let (ordinal, embedded_addend) = if pointer_format == 9 {
-                            let ordinal = usize::try_from(raw & 0xFFFF)
+                        let (ordinal, embedded_addend) = if is_arm64e {
+                            let ordinal_bits = if pointer_format == 12 { 24 } else { 16 };
+                            let ordinal_mask = (1u64 << ordinal_bits) - 1;
+                            let ordinal = usize::try_from(raw & ordinal_mask)
                                 .map_err(|_| MachOError::InvalidImportOrdinal)?;
-                            if ((raw >> 16) & 0xFFFF) != 0 {
+                            let reserved_bits = if pointer_format == 12 { (raw >> 24) & 0xFF } else { (raw >> 16) & 0xFFFF };
+                            if reserved_bits != 0 {
                                 return Err(MachOError::InvalidChainedFixups);
                             }
                             let addend = if authenticated {
@@ -457,7 +462,7 @@ where
                             None if import.weak => 0,
                             None => return Err(MachOError::UnresolvedStrongImport(import.symbol.clone())),
                         };
-                        let total_addend = if pointer_format == 9 {
+                        let total_addend = if is_arm64e {
                             import.addend.checked_add(embedded_addend.unwrap_or(0))
                                 .ok_or(MachOError::BindAddendOverflow)?
                         } else {
@@ -467,7 +472,7 @@ where
                         // PAC key/diversity/address-diversity metadata is not emulated.
                         let value = add_signed(symbol, total_addend)?;
                         patches.push((location, value.to_le_bytes()));
-                    } else if pointer_format == 9 && authenticated {
+                    } else if is_arm64e && authenticated {
                         // Rebase is handled by apply_chained_rebases.
                     }
 
