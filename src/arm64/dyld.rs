@@ -223,7 +223,7 @@ enum RegistryExport {
 #[derive(Clone, Debug, Default)]
 pub struct DylibRegistry {
     images: Vec<LoadedDylib>,
-    dependencies: std::collections::HashMap<usize, Vec<usize>>,
+    dependencies: std::collections::HashMap<usize, Vec<Option<usize>>>,
     main_executable: Option<usize>,
 }
 
@@ -231,6 +231,7 @@ pub struct DylibRegistry {
 pub enum DylibRegistryError {
     InvalidImageId,
     InvalidDependencyId,
+    MissingRequiredDependency(String),
     DuplicateInstallName,
     InvalidOrdinal(i16),
     InvalidReexportOrdinal(u64),
@@ -255,7 +256,29 @@ impl DylibRegistry {
     pub fn add_dependency(&mut self, importer: usize, dependency: usize) -> Result<(), DylibRegistryError> {
         if importer >= self.images.len() { return Err(DylibRegistryError::InvalidImageId); }
         if dependency >= self.images.len() { return Err(DylibRegistryError::InvalidDependencyId); }
-        self.dependencies.entry(importer).or_default().push(dependency);
+        self.dependencies.entry(importer).or_default().push(Some(dependency));
+        Ok(())
+    }
+
+    /// Link the importing image's ordered LC_LOAD_* commands against images
+    /// already registered in this registry. Weak missing dependencies retain
+    /// their ordinal slot; missing required dependencies fail atomically.
+    pub fn link_image_dependencies(
+        &mut self,
+        importer: usize,
+        dependencies: &[super::mach_o::DylibDependency],
+    ) -> Result<(), DylibRegistryError> {
+        if importer >= self.images.len() { return Err(DylibRegistryError::InvalidImageId); }
+        let mut linked = Vec::with_capacity(dependencies.len());
+        for dependency in dependencies {
+            let found = self.images.iter().position(|image| image.install_name == dependency.install_name);
+            match (found, dependency.kind) {
+                (Some(id), _) => linked.push(Some(id)),
+                (None, super::mach_o::DylibDependencyKind::Weak) => linked.push(None),
+                (None, _) => return Err(DylibRegistryError::MissingRequiredDependency(dependency.install_name.clone())),
+            }
+        }
+        self.dependencies.insert(importer, linked);
         Ok(())
     }
 
@@ -301,7 +324,7 @@ impl DylibRegistry {
                 )?;
                 let dependency_id = library_ordinal.checked_sub(1)
                     .and_then(|index| usize::try_from(index).ok())
-                    .and_then(|index| dependencies.get(index).copied())
+                    .and_then(|index| dependencies.get(index).copied().flatten())
                     .ok_or(DylibRegistryError::InvalidReexportOrdinal(*library_ordinal))?;
                 let forwarded_name = if imported_name.is_empty() { name } else { imported_name.as_str() };
                 self.resolve_in(dependency_id, forwarded_name, active, depth + 1)
@@ -337,7 +360,10 @@ impl DylibRegistry {
                 let dependencies = self.dependencies.get(&importer).ok_or(DylibRegistryError::InvalidOrdinal(value))?;
                 let dependency = dependencies.get((value - 1) as usize)
                     .ok_or(DylibRegistryError::InvalidOrdinal(value))?;
-                self.find_in(*dependency, &import.symbol)
+                match dependency {
+                    Some(id) => self.find_in(*id, &import.symbol),
+                    None => Ok(None),
+                }
             }
             value => Err(DylibRegistryError::InvalidOrdinal(value)),
         }
