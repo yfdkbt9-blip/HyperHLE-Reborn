@@ -89,6 +89,121 @@ pub fn parse_chained_imports(payload: &[u8]) -> Result<Vec<ChainedImport>, Chain
     Ok(imports)
 }
 
+
+/// One symbol decoded from an export trie.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ExportKind {
+    Regular { address: u64 },
+    Reexport { library_ordinal: u64, imported_name: String },
+    StubAndResolver { stub: u64, resolver: u64 },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ExportedSymbol {
+    pub name: String,
+    pub flags: u64,
+    pub kind: ExportKind,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ExportTrieError {
+    Truncated,
+    InvalidUleb128,
+    InvalidEdge,
+    InvalidUtf8,
+    InvalidTerminal,
+    UnsupportedFlags,
+    ChildOutOfRange,
+    Cycle,
+    ExcessiveDepth,
+}
+
+/// Decode a bounded Mach-O export trie. Child offsets are relative to the
+/// beginning of the trie; only recursion-stack cycles are rejected, so valid
+/// shared subtrees remain representable.
+pub fn parse_export_trie(data: &[u8]) -> Result<Vec<ExportedSymbol>, ExportTrieError> {
+    fn uleb(data: &[u8], cursor: &mut usize, end: usize) -> Result<u64, ExportTrieError> {
+        let mut value = 0u64;
+        let mut shift = 0u32;
+        loop {
+            if *cursor >= end { return Err(ExportTrieError::Truncated); }
+            let byte = data[*cursor];
+            *cursor += 1;
+            let part = u64::from(byte & 0x7f);
+            if shift >= 64 || (shift == 63 && part > 1) {
+                return Err(ExportTrieError::InvalidUleb128);
+            }
+            value |= part.checked_shl(shift).ok_or(ExportTrieError::InvalidUleb128)?;
+            if byte & 0x80 == 0 { return Ok(value); }
+            shift = shift.checked_add(7).ok_or(ExportTrieError::InvalidUleb128)?;
+            if shift >= 70 { return Err(ExportTrieError::InvalidUleb128); }
+        }
+    }
+    fn nul_string(data: &[u8], cursor: &mut usize, end: usize) -> Result<String, ExportTrieError> {
+        let tail = data.get(*cursor..end).ok_or(ExportTrieError::Truncated)?;
+        let len = tail.iter().position(|b| *b == 0).ok_or(ExportTrieError::InvalidEdge)?;
+        let value = std::str::from_utf8(&tail[..len]).map_err(|_| ExportTrieError::InvalidUtf8)?.to_owned();
+        *cursor = cursor.checked_add(len + 1).ok_or(ExportTrieError::Truncated)?;
+        Ok(value)
+    }
+    fn walk(
+        data: &[u8], offset: usize, prefix: &str, active: &mut std::collections::HashSet<usize>,
+        output: &mut Vec<ExportedSymbol>, depth: usize,
+    ) -> Result<(), ExportTrieError> {
+        if depth > 1024 { return Err(ExportTrieError::ExcessiveDepth); }
+        if offset >= data.len() { return Err(ExportTrieError::ChildOutOfRange); }
+        if !active.insert(offset) { return Err(ExportTrieError::Cycle); }
+        let result = (|| {
+            let mut cursor = offset;
+            let terminal_size = usize::try_from(uleb(data, &mut cursor, data.len())?)
+                .map_err(|_| ExportTrieError::InvalidTerminal)?;
+            let terminal_end = cursor.checked_add(terminal_size).ok_or(ExportTrieError::InvalidTerminal)?;
+            if terminal_end > data.len() { return Err(ExportTrieError::InvalidTerminal); }
+            if terminal_size != 0 {
+                let mut terminal_cursor = cursor;
+                let flags = uleb(data, &mut terminal_cursor, terminal_end)?;
+                let kind = if flags & 0x08 != 0 {
+                    let ordinal = uleb(data, &mut terminal_cursor, terminal_end)?;
+                    let imported_name = nul_string(data, &mut terminal_cursor, terminal_end)?;
+                    ExportKind::Reexport { library_ordinal: ordinal, imported_name }
+                } else {
+                    let address = uleb(data, &mut terminal_cursor, terminal_end)?;
+                    if flags & 0x10 != 0 {
+                        let resolver = uleb(data, &mut terminal_cursor, terminal_end)?;
+                        ExportKind::StubAndResolver { stub: address, resolver }
+                    } else {
+                        ExportKind::Regular { address }
+                    }
+                };
+                if terminal_cursor != terminal_end { return Err(ExportTrieError::InvalidTerminal); }
+                output.push(ExportedSymbol { name: prefix.to_owned(), flags, kind });
+            }
+            cursor = terminal_end;
+            let child_count = *data.get(cursor).ok_or(ExportTrieError::Truncated)? as usize;
+            cursor += 1;
+            for _ in 0..child_count {
+                let edge = nul_string(data, &mut cursor, data.len())?;
+                if edge.is_empty() { return Err(ExportTrieError::InvalidEdge); }
+                let child = usize::try_from(uleb(data, &mut cursor, data.len())?)
+                    .map_err(|_| ExportTrieError::ChildOutOfRange)?;
+                let mut name = String::with_capacity(prefix.len() + edge.len());
+                name.push_str(prefix);
+                name.push_str(&edge);
+                walk(data, child, &name, active, output, depth + 1)?;
+            }
+            Ok(())
+        })();
+        active.remove(&offset);
+        result
+    }
+
+    if data.is_empty() { return Ok(Vec::new()); }
+    let mut output = Vec::new();
+    let mut active = std::collections::HashSet::new();
+    walk(data, 0, "", &mut active, &mut output, 0)?;
+    Ok(output)
+}
+
 pub const A64_SVC_BASE: u32 = 0xD400_0001;
 pub const A64_RET_X30: u32 = 0xD65F_03C0;
 pub const A64_BRK_BASE: u32 = 0xD420_0000;
