@@ -523,7 +523,13 @@ impl MachOImage {
         let text = segments.get(text_index.ok_or(MachOError::MissingTextSegment)?)
             .ok_or(MachOError::MissingTextSegment)?;
         let text_base = text.address;
-        let entry_point = resolve_main_entry(text, entry_offset.ok_or(MachOError::MissingEntryPoint)?, 0)?;
+        // MH_EXECUTE (2) images use LC_MAIN. MH_DYLIB (6) images are entered
+        // through their clients and normally have no LC_MAIN command.
+        let entry_point = match entry_offset {
+            Some(offset) => resolve_main_entry(text, offset, 0)?,
+            None if header.filetype == 6 => 0,
+            None => return Err(MachOError::MissingEntryPoint),
+        };
 
         // Validate all address ranges and reject overlapping VM segments before
         // mutating guest memory. Silently merging two segment mappings would
