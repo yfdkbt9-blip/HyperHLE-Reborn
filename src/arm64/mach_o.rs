@@ -227,7 +227,7 @@ fn apply_chained_rebases(payload: &[u8], segments: &[Segment], image_base: Guest
         let format=u16_at(payload,info+6)?;
         let seg_off=u64::from_le_bytes(payload.get(info+8..info+16).ok_or(MachOError::InvalidChainedFixups)?.try_into().map_err(|_|MachOError::InvalidChainedFixups)?);
         let pages=usize::from(u16_at(payload,info+20)?);
-        if format!=6 { return Err(MachOError::UnsupportedPointerFormat); }
+        if format!=6 && format!=9 { return Err(MachOError::UnsupportedPointerFormat); }
         let page_array_size=pages.checked_mul(2).and_then(|v|v.checked_add(22)).ok_or(MachOError::InvalidChainedFixups)?;
         if (page_size!=0x1000 && page_size!=0x4000) || size<page_array_size { return Err(MachOError::InvalidChainedFixups); }
         let expected=seg.address.checked_sub(slide).and_then(|a|a.checked_sub(image_base)).ok_or(MachOError::InvalidChainedFixups)?;
@@ -240,24 +240,42 @@ fn apply_chained_rebases(payload: &[u8], segments: &[Segment], image_base: Guest
             let page_base=seg.address.checked_add((page as u64).checked_mul(page_size).ok_or(MachOError::InvalidChainedFixups)?).ok_or(MachOError::AddressOverflow)?;
             let page_end=page_base.checked_add(page_size).ok_or(MachOError::AddressOverflow)?.min(seg_end);
             for chain_start in starts_for_page {
+            let stride = if format == 9 { 8 } else { 4 };
             if u64::from(chain_start).checked_add(8).ok_or(MachOError::AddressOverflow)? > page_size
-                || chain_start & 3 != 0 { return Err(MachOError::InvalidChainedFixups); }
+                || u64::from(chain_start) % stride != 0 { return Err(MachOError::InvalidChainedFixups); }
             let mut loc=page_base.checked_add(u64::from(chain_start)).ok_or(MachOError::AddressOverflow)?;
             loop {
                 if loc.checked_add(8).ok_or(MachOError::AddressOverflow)?>page_end { return Err(MachOError::InvalidChainedFixups); }
                 let mut bytes=[0u8;8]; memory.read(loc,&mut bytes)?;
                 let raw=u64::from_le_bytes(bytes);
-                if raw>>63!=0 { return Err(MachOError::UnsupportedChainedBind); }
-                if ((raw >> 44) & 0x7F) != 0 { return Err(MachOError::InvalidChainedFixups); }
-                let target=raw & ((1u64<<36)-1);
-                let high8=(raw>>36)&0xFF;
-                let resolved=image_base.checked_add(target).and_then(|v|v.checked_add(slide)).ok_or(MachOError::AddressOverflow)?;
-                if resolved>0x00FF_FFFF_FFFF_FFFF { return Err(MachOError::AddressOverflow); }
-                let value=(resolved & 0x00FF_FFFF_FFFF_FFFF)|(high8<<56);
-                patches.push((loc,value.to_le_bytes()));
-                let next=(raw>>51)&0xFFF;
+                let next=(raw>>51)&0x7FF;
+                let is_bind = raw & (1u64<<62) != 0;
+                let authenticated = raw & (1u64<<63) != 0;
+                if format == 9 {
+                    if is_bind { return Err(MachOError::UnsupportedChainedBind); }
+                    // ARM64E_USERLAND rebase targets are image-relative offsets.
+                    // Authenticated pointers retain their PAC metadata in the file,
+                    // but this portable emulator writes the unsigned guest address.
+                    let target = if authenticated { raw & 0xFFFF_FFFF } else { raw & ((1u64<<43)-1) };
+                    let resolved=image_base.checked_add(target).and_then(|v|v.checked_add(slide)).ok_or(MachOError::AddressOverflow)?;
+                    if resolved>0x00FF_FFFF_FFFF_FFFF { return Err(MachOError::AddressOverflow); }
+                    let value = if authenticated { resolved } else {
+                        let high8=(raw>>43)&0xFF;
+                        (resolved & 0x00FF_FFFF_FFFF_FFFF)|(high8<<56)
+                    };
+                    patches.push((loc,value.to_le_bytes()));
+                } else {
+                    if is_bind { return Err(MachOError::UnsupportedChainedBind); }
+                    if ((raw >> 44) & 0x7F) != 0 { return Err(MachOError::InvalidChainedFixups); }
+                    let target=raw & ((1u64<<36)-1);
+                    let high8=(raw>>36)&0xFF;
+                    let resolved=image_base.checked_add(target).and_then(|v|v.checked_add(slide)).ok_or(MachOError::AddressOverflow)?;
+                    if resolved>0x00FF_FFFF_FFFF_FFFF { return Err(MachOError::AddressOverflow); }
+                    let value=(resolved & 0x00FF_FFFF_FFFF_FFFF)|(high8<<56);
+                    patches.push((loc,value.to_le_bytes()));
+                }
                 if next==0 { break; }
-                loc=loc.checked_add(next*4).ok_or(MachOError::AddressOverflow)?;
+                loc=loc.checked_add(next.checked_mul(stride).ok_or(MachOError::AddressOverflow)?).ok_or(MachOError::AddressOverflow)?;
             }
             }
         }
