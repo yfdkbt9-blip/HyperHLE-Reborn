@@ -47,6 +47,16 @@ impl<'a> IntegerArguments<'a> {
         self.next_u64()
     }
 
+    /// Read a signed 32-bit integer argument.
+    pub fn next_i32(&mut self) -> Result<i32, MemoryError> {
+        self.next_u32().map(|value| value as i32)
+    }
+
+    /// Read a signed 64-bit integer argument.
+    pub fn next_i64(&mut self) -> Result<i64, MemoryError> {
+        self.next_u64().map(|value| value as i64)
+    }
+
     /// Read the next 64-bit integer/pointer argument. X0-X7 are used first;
     /// subsequent arguments are read from the caller-provided stack area.
     pub fn next_u64(&mut self) -> Result<u64, MemoryError> {
@@ -125,6 +135,17 @@ mod tests {
         let mut args = IntegerArguments::new(&context, &memory);
         for expected in 10..=17 { assert_eq!(args.next_u64().unwrap(), expected); }
         assert_eq!(args.next_u64().unwrap(), 0xfeed_face_cafe_beef);
+    }
+
+    #[test]
+    fn signed_integer_arguments_preserve_twos_complement_values() {
+        let memory = GuestMemory::new();
+        let mut context = CpuContext::default();
+        context.x[0] = 0xFFFF_FFFF_FFFF_FF80;
+        context.x[1] = 0xFFFF_FFFF_8000_0000;
+        let mut args = IntegerArguments::new(&context, &memory);
+        assert_eq!(args.next_i64().unwrap(), -128);
+        assert_eq!(args.next_i32().unwrap(), i32::MIN);
     }
 
     #[test]
