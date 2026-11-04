@@ -204,6 +204,92 @@ pub fn parse_export_trie(data: &[u8]) -> Result<Vec<ExportedSymbol>, ExportTrieE
     Ok(output)
 }
 
+
+/// Loaded image registered with the experimental dyld symbol table.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LoadedDylib {
+    pub install_name: String,
+    pub exports: std::collections::HashMap<String, GuestAddr>,
+}
+
+/// Per-image dependency ordinals and globally loaded dylib exports.
+/// Ordinals are interpreted in the importing image's load-command order.
+#[derive(Clone, Debug, Default)]
+pub struct DylibRegistry {
+    images: Vec<LoadedDylib>,
+    dependencies: std::collections::HashMap<usize, Vec<usize>>,
+    main_executable: Option<usize>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DylibRegistryError {
+    InvalidImageId,
+    InvalidDependencyId,
+    DuplicateInstallName,
+    InvalidOrdinal(i16),
+}
+
+impl DylibRegistry {
+    pub fn new() -> Self { Self::default() }
+
+    pub fn register_image(&mut self, install_name: impl Into<String>, is_main: bool) -> Result<usize, DylibRegistryError> {
+        let install_name = install_name.into();
+        if self.images.iter().any(|image| image.install_name == install_name) {
+            return Err(DylibRegistryError::DuplicateInstallName);
+        }
+        let id = self.images.len();
+        self.images.push(LoadedDylib { install_name, exports: std::collections::HashMap::new() });
+        if is_main { self.main_executable = Some(id); }
+        Ok(id)
+    }
+
+    pub fn add_dependency(&mut self, importer: usize, dependency: usize) -> Result<(), DylibRegistryError> {
+        if importer >= self.images.len() { return Err(DylibRegistryError::InvalidImageId); }
+        if dependency >= self.images.len() { return Err(DylibRegistryError::InvalidDependencyId); }
+        self.dependencies.entry(importer).or_default().push(dependency);
+        Ok(())
+    }
+
+    pub fn add_export(&mut self, image: usize, name: impl Into<String>, address: GuestAddr) -> Result<(), DylibRegistryError> {
+        let image = self.images.get_mut(image).ok_or(DylibRegistryError::InvalidImageId)?;
+        image.exports.insert(name.into(), address);
+        Ok(())
+    }
+
+    pub fn image(&self, id: usize) -> Option<&LoadedDylib> { self.images.get(id) }
+
+    fn find_in(&self, image: usize, name: &str) -> Option<GuestAddr> {
+        self.images.get(image)?.exports.get(name).copied()
+    }
+
+    /// Resolve an import using its signed Mach-O library ordinal.
+    /// Ordinal 0 means self; -1 main executable; -2 flat lookup; -3 weak lookup.
+    /// Positive ordinals are one-based indexes in the importer's dependency list.
+    pub fn resolve(&self, importer: usize, import: &ChainedImport) -> Result<Option<GuestAddr>, DylibRegistryError> {
+        if importer >= self.images.len() { return Err(DylibRegistryError::InvalidImageId); }
+        let ordinal = import.library_ordinal;
+        match ordinal {
+            0 => Ok(self.find_in(importer, &import.symbol)),
+            -1 => Ok(self.main_executable.and_then(|id| self.find_in(id, &import.symbol))),
+            -2 | -3 => {
+                for (id, image) in self.images.iter().enumerate() {
+                    if let Some(address) = image.exports.get(&import.symbol) { return Ok(Some(*address)); }
+                }
+                Ok(None)
+            }
+            value if value > 0 => {
+                let dependencies = self.dependencies.get(&importer).ok_or(DylibRegistryError::InvalidOrdinal(value))?;
+                let dependency = dependencies.get((value - 1) as usize)
+                    .ok_or(DylibRegistryError::InvalidOrdinal(value))?;
+                Ok(self.find_in(*dependency, &import.symbol))
+            }
+            value => Err(DylibRegistryError::InvalidOrdinal(value)),
+        }
+    }
+
+    pub fn image_count(&self) -> usize { self.images.len() }
+}
+
 pub const A64_SVC_BASE: u32 = 0xD400_0001;
 pub const A64_RET_X30: u32 = 0xD65F_03C0;
 pub const A64_BRK_BASE: u32 = 0xD420_0000;
