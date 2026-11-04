@@ -99,7 +99,7 @@ impl MachOImage {
 
         let mut segments = Vec::new();
         let mut text_vmaddr = None;
-        let mut entryoff = None;
+        let mut entry_offset = None;
         let mut dynamic_libraries = Vec::new();
         for MachCommand(command, _) in &commands {
             match command {
@@ -122,7 +122,7 @@ impl MachOImage {
                     });
                 }
                 LoadCommand::EntryPoint { entryoff, .. } => {
-                    if entryoff.replace(*entryoff).is_some() { return Err(MachOError::MissingEntryPoint); }
+                    if entry_offset.replace(*entryoff).is_some() { return Err(MachOError::MissingEntryPoint); }
                 }
                 LoadCommand::LoadDyLib(dylib) => dynamic_libraries.push(dylib.name.to_string()),
                 LoadCommand::LoadWeakDyLib(dylib) => dynamic_libraries.push(dylib.name.to_string()),
@@ -132,7 +132,7 @@ impl MachOImage {
         }
         let text_base = text_vmaddr.ok_or(MachOError::MissingTextSegment)?
             .checked_add(slide).ok_or(MachOError::AddressOverflow)?;
-        let entry_point = text_base.checked_add(entryoff.ok_or(MachOError::MissingEntryPoint)?)
+        let entry_point = text_base.checked_add(entry_offset.ok_or(MachOError::MissingEntryPoint)?)
             .ok_or(MachOError::AddressOverflow)?;
         let mut end_address = 0;
         for segment in &segments {
