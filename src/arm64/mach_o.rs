@@ -322,14 +322,22 @@ where
 {
     fn u16_at(data: &[u8], at: usize) -> Result<u16, MachOError> {
         let end = at.checked_add(2).ok_or(MachOError::InvalidChainedFixups)?;
-        let b = data.get(at..end).ok_or(MachOError::InvalidChainedFixups)?;
-        Ok(u16::from_le_bytes([b[0], b[1]]))
+        let bytes = data.get(at..end).ok_or(MachOError::InvalidChainedFixups)?;
+        Ok(u16::from_le_bytes([bytes[0], bytes[1]]))
     }
     fn u32_at(data: &[u8], at: usize) -> Result<u32, MachOError> {
         let end = at.checked_add(4).ok_or(MachOError::InvalidChainedFixups)?;
-        let b = data.get(at..end).ok_or(MachOError::InvalidChainedFixups)?;
-        Ok(u32::from_le_bytes(b.try_into().map_err(|_| MachOError::InvalidChainedFixups)?))
+        let bytes = data.get(at..end).ok_or(MachOError::InvalidChainedFixups)?;
+        Ok(u32::from_le_bytes(bytes.try_into().map_err(|_| MachOError::InvalidChainedFixups)?))
     }
+    fn add_signed(base: u64, addend: i64) -> Result<u64, MachOError> {
+        if addend >= 0 {
+            base.checked_add(addend as u64)
+        } else {
+            base.checked_sub(addend.unsigned_abs())
+        }.ok_or(MachOError::BindAddendOverflow)
+    }
+
     let payload = match image.chained_fixups.as_deref() {
         Some(data) => data,
         None => return Ok(()),
@@ -362,7 +370,9 @@ where
                 .try_into().map_err(|_| MachOError::InvalidChainedFixups)?
         );
         let page_count = usize::from(u16_at(payload, info + 20)?);
-        if pointer_format != 6 { return Err(MachOError::UnsupportedPointerFormat); }
+        if pointer_format != 6 && pointer_format != 9 {
+            return Err(MachOError::UnsupportedPointerFormat);
+        }
         if page_size != 0x1000 && page_size != 0x4000 {
             return Err(MachOError::InvalidChainedFixups);
         }
@@ -374,6 +384,7 @@ where
             .ok_or(MachOError::InvalidChainedFixups)?;
         if segment_offset != expected_offset { return Err(MachOError::InvalidChainedFixups); }
 
+        let stride = if pointer_format == 9 { 8u64 } else { 4u64 };
         let segment_end = segment.address.checked_add(segment.memory_size)
             .ok_or(MachOError::AddressOverflow)?;
         for page_index in 0..page_count {
@@ -387,49 +398,75 @@ where
             let page_end = page_base.checked_add(page_size)
                 .ok_or(MachOError::AddressOverflow)?.min(segment_end);
             for chain_start in starts_for_page {
-            if u64::from(chain_start).checked_add(8).ok_or(MachOError::AddressOverflow)? > page_size
-                || chain_start & 3 != 0 { return Err(MachOError::InvalidChainedFixups); }
-            let mut location = page_base.checked_add(u64::from(chain_start))
-                .ok_or(MachOError::AddressOverflow)?;
-            loop {
-                if location.checked_add(8).ok_or(MachOError::AddressOverflow)? > page_end {
+                if u64::from(chain_start).checked_add(8).ok_or(MachOError::AddressOverflow)? > page_size
+                    || u64::from(chain_start) % stride != 0 {
                     return Err(MachOError::InvalidChainedFixups);
                 }
-                let mut raw_bytes = [0u8; 8];
-                memory.read(location, &mut raw_bytes)?;
-                let raw = u64::from_le_bytes(raw_bytes);
-                if raw >> 63 != 0 {
-                    let import_index = usize::try_from(raw & 0x00FF_FFFF)
-                        .map_err(|_| MachOError::InvalidImportOrdinal)?;
-                    let import = imports.get(import_index).ok_or(MachOError::InvalidImportOrdinal)?;
-                    let inline_addend = ((raw >> 24) & 0xFF) as u8;
-                    let embedded_reserved = (raw >> 32) & 0x7_FFFF;
-                    if embedded_reserved != 0 { return Err(MachOError::InvalidChainedFixups); }
-                    let symbol = match resolve(import) {
-                        Some(address) => address,
-                        None if import.weak => 0,
-                        None => return Err(MachOError::UnresolvedStrongImport(import.symbol.clone())),
-                    };
-                    // In the generic 64-bit bind encoding, a non-zero inline
-                    // addend replaces (rather than augments) the import addend.
-                    let total_addend = if inline_addend != 0 {
-                        i64::from(inline_addend)
-                    } else {
-                        import.addend
-                    };
-                    let value = if total_addend >= 0 {
-                        symbol.checked_add(total_addend as u64)
-                    } else {
-                        symbol.checked_sub(total_addend.unsigned_abs())
-                    }.ok_or(MachOError::BindAddendOverflow)?;
-                    patches.push((location, value.to_le_bytes()));
-                }
-                let next = (raw >> 51) & 0xFFF;
-                if next == 0 { break; }
-                location = location.checked_add(next.checked_mul(4)
-                    .ok_or(MachOError::AddressOverflow)?)
+                let mut location = page_base.checked_add(u64::from(chain_start))
                     .ok_or(MachOError::AddressOverflow)?;
-            }
+                loop {
+                    if location.checked_add(8).ok_or(MachOError::AddressOverflow)? > page_end {
+                        return Err(MachOError::InvalidChainedFixups);
+                    }
+                    let mut raw_bytes = [0u8; 8];
+                    memory.read(location, &mut raw_bytes)?;
+                    let raw = u64::from_le_bytes(raw_bytes);
+                    let (is_bind, authenticated, next) = if pointer_format == 9 {
+                        (raw & (1u64 << 62) != 0, raw & (1u64 << 63) != 0, (raw >> 51) & 0x7FF)
+                    } else {
+                        (raw & (1u64 << 63) != 0, false, (raw >> 51) & 0xFFF)
+                    };
+
+                    if is_bind {
+                        let (ordinal, embedded_addend) = if pointer_format == 9 {
+                            let ordinal = usize::try_from(raw & 0xFFFF)
+                                .map_err(|_| MachOError::InvalidImportOrdinal)?;
+                            if ((raw >> 16) & 0xFFFF) != 0 {
+                                return Err(MachOError::InvalidChainedFixups);
+                            }
+                            let addend = if authenticated {
+                                0
+                            } else {
+                                let bits = ((raw >> 32) & 0x7_FFFF) as i64;
+                                if bits & 0x4_0000 != 0 { bits | !0x7_FFFF } else { bits }
+                            };
+                            (ordinal, addend)
+                        } else {
+                            let ordinal = usize::try_from(raw & 0x00FF_FFFF)
+                                .map_err(|_| MachOError::InvalidImportOrdinal)?;
+                            let inline_addend = ((raw >> 24) & 0xFF) as u8;
+                            let embedded_reserved = (raw >> 32) & 0x7_FFFF;
+                            if embedded_reserved != 0 { return Err(MachOError::InvalidChainedFixups); }
+                            // Generic 64-bit inline addend replaces the import addend.
+                            (ordinal, if inline_addend != 0 { i64::from(inline_addend) } else { i64::MIN })
+                        };
+                        let import = imports.get(ordinal).ok_or(MachOError::InvalidImportOrdinal)?;
+                        let symbol = match resolve(import) {
+                            Some(address) => address,
+                            None if import.weak => 0,
+                            None => return Err(MachOError::UnresolvedStrongImport(import.symbol.clone())),
+                        };
+                        let total_addend = if pointer_format == 9 {
+                            import.addend.checked_add(embedded_addend)
+                                .ok_or(MachOError::BindAddendOverflow)?
+                        } else if embedded_addend == i64::MIN {
+                            import.addend
+                        } else {
+                            embedded_addend
+                        };
+                        // Authenticated binds are emitted as unsigned guest pointers.
+                        // PAC key/diversity/address-diversity metadata is not emulated.
+                        let value = add_signed(symbol, total_addend)?;
+                        patches.push((location, value.to_le_bytes()));
+                    } else if pointer_format == 9 && authenticated {
+                        // Rebase is handled by apply_chained_rebases.
+                    }
+
+                    if next == 0 { break; }
+                    location = location.checked_add(next.checked_mul(stride)
+                        .ok_or(MachOError::AddressOverflow)?)
+                        .ok_or(MachOError::AddressOverflow)?;
+                }
             }
         }
     }
