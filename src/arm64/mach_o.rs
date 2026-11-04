@@ -25,6 +25,7 @@ pub enum DylibDependencyKind {
     Required,
     Weak,
     Reexport,
+    Upward,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -41,6 +42,8 @@ pub struct MachOImage {
     pub dynamic_libraries: Vec<String>,
     /// Ordered dependencies with their original load-command semantics.
     pub dependencies: Vec<DylibDependency>,
+    /// Ordered LC_RPATH entries used to resolve @rpath dependencies.
+    pub rpaths: Vec<String>,
     /// Raw LC_DYLD_CHAINED_FIXUPS payload. Parsed separately by the A64 dyld layer.
     pub chained_fixups: Option<Vec<u8>>,
     /// Raw LC_DYLD_EXPORTS_TRIE payload, decoded by the A64 dyld layer.
@@ -450,6 +453,7 @@ impl MachOImage {
         let mut entry_offset = None;
         let mut dynamic_libraries = Vec::new();
         let mut dependencies = Vec::new();
+        let mut rpaths = Vec::new();
         let mut chained_fixups = None;
         let mut exports_trie = None;
         for MachCommand(command, _) in &commands {
@@ -516,6 +520,12 @@ impl MachOImage {
                     dynamic_libraries.push(name.clone());
                     dependencies.push(DylibDependency { install_name: name, kind: DylibDependencyKind::Reexport });
                 }
+                LoadCommand::LoadUpwardDylib(dylib) => {
+                    let name = dylib.name.to_string();
+                    dynamic_libraries.push(name.clone());
+                    dependencies.push(DylibDependency { install_name: name, kind: DylibDependencyKind::Upward });
+                }
+                LoadCommand::Rpath(path) => rpaths.push(path.clone()),
                 _ => {}
             }
         }
@@ -567,7 +577,7 @@ impl MachOImage {
             let image_base = text_base.checked_sub(slide).ok_or(MachOError::AddressOverflow)?;
             apply_chained_rebases(payload, &segments, image_base, slide, memory)?;
         }
-        Ok(Self { segments, entry_point, dynamic_libraries, dependencies, chained_fixups, exports_trie, text_base, end_address })
+        Ok(Self { segments, entry_point, dynamic_libraries, dependencies, rpaths, chained_fixups, exports_trie, text_base, end_address })
     }
 }
 
@@ -650,7 +660,7 @@ mod tests {
             file_offset: 0, file_size: 0x1000, initial_protection: 3,
         };
         let image = MachOImage {
-            segments: vec![segment], entry_point: 0, dynamic_libraries: vec![], dependencies: vec![],
+            segments: vec![segment], entry_point: 0, dynamic_libraries: vec![], dependencies: vec![], rpaths: vec![],
             chained_fixups: Some(payload), exports_trie: None,
             text_base: 0x1_0000_0000, end_address: 0x1_0000_1000,
         };
