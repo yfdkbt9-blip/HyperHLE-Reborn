@@ -237,6 +237,9 @@ pub enum DylibRegistryError {
     InvalidReexportOrdinal(u64),
     ReexportCycle,
     ReexportDepthExceeded,
+    InvalidExportTrie,
+    UnsupportedExportKind,
+    AddressOverflow,
 }
 
 impl DylibRegistry {
@@ -386,6 +389,47 @@ impl DylibRegistry {
             }
             value => Err(DylibRegistryError::InvalidOrdinal(value)),
         }
+    }
+
+    /// Register an already mapped Mach-O image and import its export trie
+    /// into the shared symbol table. Dependency linking is a separate step so
+    /// callers can register an entire dependency graph before resolving binds.
+    pub fn register_macho_image(
+        &mut self,
+        install_name: impl Into<String>,
+        image: &super::mach_o::MachOImage,
+        is_main: bool,
+    ) -> Result<usize, DylibRegistryError> {
+        let exports = image.exported_symbols()
+            .map_err(|_| DylibRegistryError::InvalidExportTrie)?;
+        let id = self.register_image(install_name, is_main)?;
+        for export in exports {
+            match export.kind {
+                ExportKind::Regular { address } => {
+                    let kind = export.flags & 0x03;
+                    let resolved = match kind {
+                        0 => image.text_base.checked_add(address)
+                            .ok_or(DylibRegistryError::AddressOverflow)?,
+                        2 => address,
+                        _ => return Err(DylibRegistryError::UnsupportedExportKind),
+                    };
+                    if export.flags & 0x04 != 0 {
+                        self.add_weak_export(id, export.name, resolved)?;
+                    } else {
+                        self.add_export(id, export.name, resolved)?;
+                    }
+                }
+                ExportKind::StubAndResolver { stub, .. } => {
+                    let address = image.text_base.checked_add(stub)
+                        .ok_or(DylibRegistryError::AddressOverflow)?;
+                    self.add_export(id, export.name, address)?;
+                }
+                ExportKind::Reexport { library_ordinal, imported_name } => {
+                    self.add_reexport(id, export.name, library_ordinal, imported_name)?;
+                }
+            }
+        }
+        Ok(id)
     }
 
     pub fn image_count(&self) -> usize { self.images.len() }
