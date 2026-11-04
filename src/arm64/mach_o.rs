@@ -38,7 +38,12 @@ pub struct DylibDependency {
 }
 
 #[derive(Clone, Debug)]
-pub struct ClassicDyldInfo {\n    pub rebases: Vec<u8>, pub binds: Vec<u8>, pub weak_binds: Vec<u8>, pub lazy_binds: Vec<u8>,\n}\n\n#[derive(Clone, Debug)]\npub struct MachOImage {
+pub struct ClassicDyldInfo {
+    pub rebases: Vec<u8>, pub binds: Vec<u8>, pub weak_binds: Vec<u8>, pub lazy_binds: Vec<u8>,
+}
+
+#[derive(Clone, Debug)]
+pub struct MachOImage {
     pub segments: Vec<Segment>,
     pub entry_point: GuestAddr,
     /// Ordered install names retained for compatibility with earlier callers.
@@ -48,7 +53,9 @@ pub struct ClassicDyldInfo {\n    pub rebases: Vec<u8>, pub binds: Vec<u8>, pub 
     /// Ordered LC_RPATH entries used to resolve @rpath dependencies.
     pub rpaths: Vec<String>,
     /// Raw LC_DYLD_CHAINED_FIXUPS payload. Parsed separately by the A64 dyld layer.
-    pub chained_fixups: Option<Vec<u8>>,\n    /// Legacy LC_DYLD_INFO opcode streams, if present.\n    pub classic_dyld_info: Option<ClassicDyldInfo>,
+    pub chained_fixups: Option<Vec<u8>>,
+    /// Legacy LC_DYLD_INFO opcode streams, if present.
+    pub classic_dyld_info: Option<ClassicDyldInfo>,
     /// Raw LC_DYLD_EXPORTS_TRIE payload, decoded by the A64 dyld layer.
     pub exports_trie: Option<Vec<u8>>,
     pub text_base: GuestAddr,
@@ -610,7 +617,8 @@ impl MachOImage {
         let mut dynamic_libraries = Vec::new();
         let mut dependencies = Vec::new();
         let mut rpaths = Vec::new();
-        let mut chained_fixups = None;\n        let mut classic_dyld_info = None;
+        let mut chained_fixups = None;
+        let mut classic_dyld_info = None;
         let mut exports_trie = None;
         for MachCommand(command, _) in &commands {
             match command {
