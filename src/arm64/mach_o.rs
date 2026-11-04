@@ -368,7 +368,8 @@ pub fn apply_chained_binds_with_registry(
     }
     apply_chained_binds(image, memory, |import| {
         registry.resolve(importer_id, import).ok().flatten()
-    })
+    })?;
+    apply_classic_binds_with_registry(image, memory, registry, importer_id)
 }
 
 pub fn apply_chained_binds<F>(
@@ -855,6 +856,16 @@ mod tests {
         let mut memory = GuestMemory::new();
         memory.map_zeroed(0x1_0000_0000, 0x1000).unwrap();
         (image, memory)
+    }
+
+    #[test]
+    fn applies_classic_rebase_to_loaded_pointer() {
+        let segment=Segment{name:"__DATA".into(),address:0x1_0000_0000,memory_size:0x1000,file_offset:0,file_size:0x1000,initial_protection:3};
+        let mut memory=GuestMemory::new();memory.map_zeroed(segment.address,segment.memory_size).unwrap();
+        memory.write(segment.address,&0x1_0000_1234u64.to_le_bytes()).unwrap();
+        apply_classic_rebases(&[0x11,0x20,0x00,0x51,0x00],&[segment],0x4000,&mut memory).unwrap();
+        let mut bytes=[0u8;8];memory.read(0x1_0000_0000,&mut bytes).unwrap();
+        assert_eq!(u64::from_le_bytes(bytes),0x1_0000_5234);
     }
 
     #[test]
