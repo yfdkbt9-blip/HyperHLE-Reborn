@@ -35,7 +35,7 @@ pub struct MachOImage {
 pub enum MachOError {
     Parse, WrongArchitecture, UnsupportedSubtype, MissingTextSegment,
     DuplicateTextSegment, DuplicateChainedFixups, MissingEntryPoint, EntryPointOutsideText,
-    InvalidSegmentRange, OverlappingSegments, AddressOverflow, Memory(MemoryError),
+    InvalidSegmentRange, InvalidChainedFixups, OverlappingSegments, AddressOverflow, Memory(MemoryError),
 }
 impl From<MemoryError> for MachOError {
     fn from(value: MemoryError) -> Self { Self::Memory(value) }
@@ -91,6 +91,74 @@ fn resolve_main_entry(text: &Segment, entryoff: u64, slide: u64) -> Result<Guest
         .ok_or(MachOError::AddressOverflow)
 }
 
+/// Validate the offset tables in an LC_DYLD_CHAINED_FIXUPS payload.
+/// This deliberately does not decode or apply pointer chains.
+fn validate_chained_fixups(data: &[u8]) -> Result<(), MachOError> {
+    fn u16_at(data: &[u8], offset: usize) -> Result<u16, MachOError> {
+        let bytes = data.get(offset..offset.checked_add(2).ok_or(MachOError::InvalidChainedFixups)?)
+            .ok_or(MachOError::InvalidChainedFixups)?;
+        Ok(u16::from_le_bytes([bytes[0], bytes[1]]))
+    }
+    fn u32_at(data: &[u8], offset: usize) -> Result<u32, MachOError> {
+        let bytes = data.get(offset..offset.checked_add(4).ok_or(MachOError::InvalidChainedFixups)?)
+            .ok_or(MachOError::InvalidChainedFixups)?;
+        Ok(u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+    }
+    fn checked_range(start: usize, count: usize, width: usize, limit: usize) -> Result<std::ops::Range<usize>, MachOError> {
+        let size = count.checked_mul(width).ok_or(MachOError::InvalidChainedFixups)?;
+        let end = start.checked_add(size).ok_or(MachOError::InvalidChainedFixups)?;
+        if start > limit || end > limit { return Err(MachOError::InvalidChainedFixups); }
+        Ok(start..end)
+    }
+
+    const HEADER_SIZE: usize = 28;
+    const STARTS_SEGMENT_HEADER_SIZE: usize = 22;
+    if data.len() < HEADER_SIZE || u32_at(data, 0)? != 0 {
+        return Err(MachOError::InvalidChainedFixups);
+    }
+    let starts_offset = usize::try_from(u32_at(data, 4)?).map_err(|_| MachOError::InvalidChainedFixups)?;
+    let imports_offset = usize::try_from(u32_at(data, 8)?).map_err(|_| MachOError::InvalidChainedFixups)?;
+    let symbols_offset = usize::try_from(u32_at(data, 12)?).map_err(|_| MachOError::InvalidChainedFixups)?;
+    let imports_count = usize::try_from(u32_at(data, 16)?).map_err(|_| MachOError::InvalidChainedFixups)?;
+    let imports_format = u32_at(data, 20)?;
+    let symbols_format = u32_at(data, 24)?;
+
+    let import_width = match imports_format {
+        1 => 4,
+        2 => 8,
+        3 => 16,
+        _ => return Err(MachOError::InvalidChainedFixups),
+    };
+    if symbols_format > 1 || starts_offset < HEADER_SIZE || symbols_offset > data.len() {
+        return Err(MachOError::InvalidChainedFixups);
+    }
+    let imports = checked_range(imports_offset, imports_count, import_width, data.len())?;
+    if imports.end > symbols_offset || imports_offset < HEADER_SIZE {
+        return Err(MachOError::InvalidChainedFixups);
+    }
+
+    // starts_in_image contains seg_count followed by seg_count u32 offsets.
+    let seg_count = usize::try_from(u32_at(data, starts_offset)?).map_err(|_| MachOError::InvalidChainedFixups)?;
+    let offsets_start = starts_offset.checked_add(4).ok_or(MachOError::InvalidChainedFixups)?;
+    let offsets = checked_range(offsets_start, seg_count, 4, data.len())?;
+    for index in 0..seg_count {
+        let relative = usize::try_from(u32_at(data, offsets.start + index * 4)?)
+            .map_err(|_| MachOError::InvalidChainedFixups)?;
+        if relative == 0 { continue; }
+        let segment_start = starts_offset.checked_add(relative).ok_or(MachOError::InvalidChainedFixups)?;
+        let size = usize::try_from(u32_at(data, segment_start)?)
+            .map_err(|_| MachOError::InvalidChainedFixups)?;
+        if size < STARTS_SEGMENT_HEADER_SIZE { return Err(MachOError::InvalidChainedFixups); }
+        let segment_end = segment_start.checked_add(size).ok_or(MachOError::InvalidChainedFixups)?;
+        if segment_end > data.len() { return Err(MachOError::InvalidChainedFixups); }
+        let page_count = usize::from(u16_at(data, segment_start + 20)?);
+        let page_array_end = STARTS_SEGMENT_HEADER_SIZE.checked_add(page_count.checked_mul(2)
+            .ok_or(MachOError::InvalidChainedFixups)?).ok_or(MachOError::InvalidChainedFixups)?;
+        if page_array_end > size { return Err(MachOError::InvalidChainedFixups); }
+    }
+    Ok(())
+}
+
 impl MachOImage {
     /// Parse an ARM64 Mach-O executable and map its 64-bit segments.
     /// slide is added to every guest virtual address.
@@ -133,7 +201,7 @@ impl MachOImage {
                     let size = usize::try_from(data.size).map_err(|_| MachOError::InvalidSegmentRange)?;
                     let finish = start.checked_add(size).ok_or(MachOError::InvalidSegmentRange)?;
                     let payload = image_bytes.get(start..finish).ok_or(MachOError::InvalidSegmentRange)?;
-                    if size < 28 { return Err(MachOError::InvalidSegmentRange); }
+                    validate_chained_fixups(payload)?;
                     chained_fixups = Some(payload.to_vec());
                 }
                 LoadCommand::LoadDyLib(dylib) => dynamic_libraries.push(dylib.name.to_string()),
