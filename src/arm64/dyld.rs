@@ -214,7 +214,7 @@ pub struct LoadedDylib {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum RegistryExport {
-    Address(GuestAddr),
+    Address { address: GuestAddr, weak_definition: bool },
     Reexport { library_ordinal: u64, imported_name: String },
 }
 
@@ -284,7 +284,18 @@ impl DylibRegistry {
 
     pub fn add_export(&mut self, image: usize, name: impl Into<String>, address: GuestAddr) -> Result<(), DylibRegistryError> {
         let image = self.images.get_mut(image).ok_or(DylibRegistryError::InvalidImageId)?;
-        image.exports.insert(name.into(), RegistryExport::Address(address));
+        image.exports.insert(name.into(), RegistryExport::Address { address, weak_definition: false });
+        Ok(())
+    }
+
+    pub fn add_weak_export(
+        &mut self,
+        image: usize,
+        name: impl Into<String>,
+        address: GuestAddr,
+    ) -> Result<(), DylibRegistryError> {
+        let image = self.images.get_mut(image).ok_or(DylibRegistryError::InvalidImageId)?;
+        image.exports.insert(name.into(), RegistryExport::Address { address, weak_definition: true });
         Ok(())
     }
 
@@ -317,7 +328,7 @@ impl DylibRegistry {
         if !active.insert(key.clone()) { return Err(DylibRegistryError::ReexportCycle); }
         let result = match self.images.get(image_id).and_then(|image| image.exports.get(name)) {
             None => Ok(None),
-            Some(RegistryExport::Address(address)) => Ok(Some(*address)),
+            Some(RegistryExport::Address { address, .. }) => Ok(Some(*address)),
             Some(RegistryExport::Reexport { library_ordinal, imported_name }) => {
                 let dependencies = self.dependencies.get(&image_id).ok_or(
                     DylibRegistryError::InvalidReexportOrdinal(*library_ordinal)
@@ -350,9 +361,17 @@ impl DylibRegistry {
                 Some(id) => self.find_in(id, &import.symbol),
                 None => Ok(None),
             },
-            -2 | -3 => {
+            -2 => {
                 for id in 0..self.images.len() {
                     if let Some(address) = self.find_in(id, &import.symbol)? { return Ok(Some(address)); }
+                }
+                Ok(None)
+            }
+            -3 => {
+                for image in &self.images {
+                    if let Some(RegistryExport::Address { address, weak_definition: true }) = image.exports.get(&import.symbol) {
+                        return Ok(Some(*address));
+                    }
                 }
                 Ok(None)
             }
@@ -598,6 +617,18 @@ mod tests {
         );
         let old = ChainedImport { library_ordinal: 1, weak: false, symbol: "_x".into(), addend: 0 };
         assert_eq!(registry.resolve(app, &old).unwrap(), None);
+    }
+
+    #[test]
+    fn weak_lookup_only_returns_weak_definitions() {
+        let mut registry = DylibRegistry::new();
+        let app = registry.register_image("/App", true).unwrap();
+        let strong = registry.register_image("/Strong.dylib", false).unwrap();
+        let weak = registry.register_image("/Weak.dylib", false).unwrap();
+        registry.add_export(strong, "_symbol", 0x1000).unwrap();
+        registry.add_weak_export(weak, "_symbol", 0x2000).unwrap();
+        let weak_lookup = ChainedImport { library_ordinal: -3, weak: false, symbol: "_symbol".into(), addend: 0 };
+        assert_eq!(registry.resolve(app, &weak_lookup).unwrap(), Some(0x2000));
     }
 
 }
