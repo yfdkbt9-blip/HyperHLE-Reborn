@@ -834,6 +834,7 @@ mod tests {
             entry_point: 0,
             dynamic_libraries: vec![],
             dependencies: vec![],
+            rpaths: vec![],
             chained_fixups: None,
             exports_trie: None,
             text_base: 0x1_0000_0000,
@@ -850,6 +851,41 @@ mod tests {
         ).unwrap();
         assert_eq!(registry.image_count(), 1);
         assert!(registry.image(0).unwrap().image.is_some());
+    }
+
+    #[test]
+    fn resolves_loader_executable_and_rpath_tokens_in_order() {
+        let runpaths = vec![
+            "/App/Frameworks".to_string(),
+            "/App/PlugIns/Widget.framework/Frameworks".to_string(),
+        ];
+        assert_eq!(
+            resolve_dylib_candidates("@rpath/Foo.framework/Foo", "/App/PlugIns/Widget", "/App",
+                &runpaths),
+            vec![
+                "/App/Frameworks/Foo.framework/Foo".to_string(),
+                "/App/PlugIns/Widget.framework/Frameworks/Foo.framework/Foo".to_string(),
+                "/App/Frameworks/Foo.framework/Versions/Current/Foo".to_string(),
+                "/App/PlugIns/Widget.framework/Frameworks/Foo.framework/Versions/Current/Foo".to_string(),
+            ]
+        );
+        assert_eq!(
+            resolve_dylib_candidates("@loader_path/../Frameworks/libX.dylib", "/App/PlugIns/P/P", "/App", &[]),
+            vec!["/App/PlugIns/Frameworks/libX.dylib".to_string()]
+        );
+        assert_eq!(
+            resolve_dylib_candidates("@executable_path/Frameworks/libX.dylib", "/App/PlugIns/P/P", "/App", &[]),
+            vec!["/App/Frameworks/libX.dylib".to_string()]
+        );
+    }
+
+    #[test]
+    fn expands_rpaths_relative_to_the_image_that_declares_them() {
+        assert_eq!(expand_rpath("@loader_path/../Frameworks", "/App/PlugIns/P/P", "/App"),
+            Some("/App/PlugIns/Frameworks".into()));
+        assert_eq!(expand_rpath("@executable_path/Frameworks", "/App/PlugIns/P/P", "/App"),
+            Some("/App/Frameworks".into()));
+        assert_eq!(expand_rpath("@rpath/Other", "/App/P", "/App"), None);
     }
 
 }
