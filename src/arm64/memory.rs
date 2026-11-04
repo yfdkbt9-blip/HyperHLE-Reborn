@@ -61,7 +61,7 @@ pub enum MemoryError {
 
 /// Sparse A64 guest memory. Pages are allocated explicitly by the loader,
 /// stack builder, or allocator; ordinary reads/writes never create mappings.
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct GuestMemory {
     pages: BTreeMap<GuestAddr, Box<[u8; PAGE_SIZE]>>,
 }
