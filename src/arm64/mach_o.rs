@@ -4,8 +4,9 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/.
  */
 //! 64-bit Mach-O image loader for the isolated A64 runtime.
-//! Generic DYLD_CHAINED_PTR_64_OFFSET and ARM64E_USERLAND chained
-//! rebases/binds are supported, including multi-start pages. Authenticated
+//! Generic DYLD_CHAINED_PTR_64_OFFSET, ARM64E_USERLAND, and
+//! ARM64E_USERLAND24 chained rebases/binds are supported, including
+//! multi-start pages. Authenticated
 //! pointers are emitted unsigned; PAC signing and LC_UNIXTHREAD remain TODO.
 
 use super::memory::{GuestAddr, GuestMemory, MemoryError};
