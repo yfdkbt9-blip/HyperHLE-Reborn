@@ -91,11 +91,12 @@ pub fn build_initial_stack(
     let argv_ptr = push_pointer_array(memory, &mut cursor, &argv_ptrs)?;
 
     cursor = cursor.checked_sub(8).ok_or(MemoryError::AddressOverflow)?;
+    cursor &= !0xf;
     let argc = argv.len() as u64;
+    if cursor < stack_base { return Err(MemoryError::AddressOverflow); }
     memory.write(cursor, &argc.to_le_bytes())?;
 
-    let sp = cursor & !0xf;
-    if sp < stack_base { return Err(MemoryError::AddressOverflow); }
+    let sp = cursor;
     Ok(InitialStack { sp, argc, argv: argv_ptr, envp: envp_ptr, apple: apple_ptr })
 }
 
