@@ -166,4 +166,5 @@ fn main() {
     }
     wrapper_build.compile("dynarmic_wrapper");
     rerun_if_changed(&package_root.join("lib.cpp"));
+    rerun_if_changed(&package_root.join("arm64.cpp"));
 }
