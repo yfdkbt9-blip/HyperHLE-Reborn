@@ -4,11 +4,7 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/.
  */
 //! Minimal 64-bit Mach-O image loader for the isolated A64 runtime.
-//!
-//! This loader deliberately handles LC_MAIN images first. A64 dyld rebasing,
-//! binding, chained fixups, and LC_UNIXTHREAD state are separate follow-up
-//! work; they are not silently treated as if the existing A32 loader handled
-//! them.
+//! Dyld fixups and LC_UNIXTHREAD remain explicit follow-up work.
 
 use super::memory::{GuestAddr, GuestMemory, MemoryError};
 use mach_object::{LoadCommand, MachCommand, OFile, CPU_TYPE_ARM64};
@@ -35,16 +31,10 @@ pub struct MachOImage {
 
 #[derive(Debug)]
 pub enum MachOError {
-    Parse,
-    WrongArchitecture,
-    UnsupportedSubtype,
-    MissingTextSegment,
-    MissingEntryPoint,
-    InvalidSegmentRange,
-    AddressOverflow,
-    Memory(MemoryError),
+    Parse, WrongArchitecture, UnsupportedSubtype, MissingTextSegment,
+    DuplicateTextSegment, MissingEntryPoint, EntryPointOutsideText,
+    InvalidSegmentRange, AddressOverflow, Memory(MemoryError),
 }
-
 impl From<MemoryError> for MachOError {
     fn from(value: MemoryError) -> Self { Self::Memory(value) }
 }
@@ -74,10 +64,9 @@ fn choose_arm64_slice(bytes: &[u8]) -> Result<&[u8], MachOError> {
                 let slice = bytes.get(start..end).ok_or(MachOError::InvalidSegmentRange)?;
                 match OFile::parse(&mut Cursor::new(slice)).map_err(|_| MachOError::Parse)? {
                     OFile::MachFile { header, .. }
-                        if header.cputype == CPU_TYPE_ARM64 && header.cpusubtype == arch.cpusubtype =>
-                    {
-                        if best.map_or(true, |(_, old)| priority > old) { best = Some((slice, priority)); }
-                    }
+                        if header.cputype == CPU_TYPE_ARM64 && header.cpusubtype == arch.cpusubtype => {
+                            if best.map_or(true, |(_, old)| priority > old) { best = Some((slice, priority)); }
+                        }
                     _ => continue,
                 }
             }
@@ -86,9 +75,23 @@ fn choose_arm64_slice(bytes: &[u8]) -> Result<&[u8], MachOError> {
     }
 }
 
+/// LC_MAIN entryoff is a file offset (normally __TEXT.fileoff is zero).
+/// Convert it using the file-to-VM delta, then apply the requested ASLR slide.
+fn resolve_main_entry(text: &Segment, entryoff: u64, slide: u64) -> Result<GuestAddr, MachOError> {
+    let text_file_end = text.file_offset.checked_add(text.file_size)
+        .ok_or(MachOError::InvalidSegmentRange)?;
+    if entryoff < text.file_offset || entryoff >= text_file_end || text.initial_protection & 0x4 == 0 {
+        return Err(MachOError::EntryPointOutsideText);
+    }
+    let delta = entryoff - text.file_offset;
+    if delta >= text.memory_size { return Err(MachOError::EntryPointOutsideText); }
+    text.address.checked_add(delta).and_then(|a| a.checked_add(slide))
+        .ok_or(MachOError::AddressOverflow)
+}
+
 impl MachOImage {
     /// Parse an ARM64 Mach-O executable and map its 64-bit segments.
-    /// `slide` is added to every guest virtual address.
+    /// slide is added to every guest virtual address.
     pub fn load(bytes: &[u8], memory: &mut GuestMemory, slide: GuestAddr) -> Result<Self, MachOError> {
         let image_bytes = choose_arm64_slice(bytes)?;
         let (header, commands) = match OFile::parse(&mut Cursor::new(image_bytes)).map_err(|_| MachOError::Parse)? {
@@ -98,7 +101,7 @@ impl MachOImage {
         if header.cputype != CPU_TYPE_ARM64 || !header.is_64bit() { return Err(MachOError::WrongArchitecture); }
 
         let mut segments = Vec::new();
-        let mut text_vmaddr = None;
+        let mut text_index = None;
         let mut entry_offset = None;
         let mut dynamic_libraries = Vec::new();
         for MachCommand(command, _) in &commands {
@@ -109,17 +112,13 @@ impl MachOImage {
                     let file_offset = u64::try_from(*fileoff).map_err(|_| MachOError::InvalidSegmentRange)?;
                     let file_size = u64::try_from(*filesize).map_err(|_| MachOError::InvalidSegmentRange)?;
                     if file_size > memory_size { return Err(MachOError::InvalidSegmentRange); }
+                    address.checked_add(memory_size).ok_or(MachOError::AddressOverflow)?;
                     let file_end = file_offset.checked_add(file_size).ok_or(MachOError::InvalidSegmentRange)?;
                     if file_end > image_bytes.len() as u64 { return Err(MachOError::InvalidSegmentRange); }
-                    if segname == "__TEXT" { text_vmaddr = Some(address); }
-                    segments.push(Segment {
-                        name: segname.clone(),
-                        address: address.checked_add(slide).ok_or(MachOError::AddressOverflow)?,
-                        memory_size,
-                        file_offset,
-                        file_size,
-                        initial_protection: *initprot as u32,
-                    });
+                    if segname == "__TEXT" && text_index.replace(segments.len()).is_some() {
+                        return Err(MachOError::DuplicateTextSegment);
+                    }
+                    segments.push(Segment { name: segname.clone(), address, memory_size, file_offset, file_size, initial_protection: *initprot as u32 });
                 }
                 LoadCommand::EntryPoint { entryoff, .. } => {
                     if entry_offset.replace(*entryoff).is_some() { return Err(MachOError::MissingEntryPoint); }
@@ -130,21 +129,60 @@ impl MachOImage {
                 _ => {}
             }
         }
-        let text_base = text_vmaddr.ok_or(MachOError::MissingTextSegment)?
-            .checked_add(slide).ok_or(MachOError::AddressOverflow)?;
-        let entry_point = text_base.checked_add(entry_offset.ok_or(MachOError::MissingEntryPoint)?)
-            .ok_or(MachOError::AddressOverflow)?;
+
+        let text = segments.get(text_index.ok_or(MachOError::MissingTextSegment)?)
+            .ok_or(MachOError::MissingTextSegment)?;
+        let text_base = text.address.checked_add(slide).ok_or(MachOError::AddressOverflow)?;
+        let entry_point = resolve_main_entry(text, entry_offset.ok_or(MachOError::MissingEntryPoint)?, slide)?;
+
+        // Validate all address ranges before mutating guest memory.
         let mut end_address = 0;
         for segment in &segments {
-            let end = segment.address.checked_add(segment.memory_size).ok_or(MachOError::AddressOverflow)?;
+            let start = segment.address.checked_add(slide).ok_or(MachOError::AddressOverflow)?;
+            let end = start.checked_add(segment.memory_size).ok_or(MachOError::AddressOverflow)?;
             end_address = end_address.max(end);
-            memory.map_zeroed(segment.address, segment.memory_size)?;
+        }
+        for segment in &segments {
+            let loaded_address = segment.address.checked_add(slide).ok_or(MachOError::AddressOverflow)?;
+            // __PAGEZERO reserves an inaccessible range; allocating its often
+            // multi-gigabyte size in the sparse guest map would be disastrous.
+            if segment.memory_size == 0 || (segment.file_size == 0 && segment.initial_protection == 0) { continue; }
+            memory.map_zeroed(loaded_address, segment.memory_size)?;
             if segment.file_size != 0 {
                 let start = usize::try_from(segment.file_offset).map_err(|_| MachOError::InvalidSegmentRange)?;
-                let finish = usize::try_from(segment.file_offset + segment.file_size).map_err(|_| MachOError::InvalidSegmentRange)?;
-                memory.write(segment.address, &image_bytes[start..finish])?;
+                let file_end = segment.file_offset.checked_add(segment.file_size).ok_or(MachOError::InvalidSegmentRange)?;
+                let finish = usize::try_from(file_end).map_err(|_| MachOError::InvalidSegmentRange)?;
+                memory.write(loaded_address, &image_bytes[start..finish])?;
             }
         }
         Ok(Self { segments, entry_point, dynamic_libraries, text_base, end_address })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    fn text(file_offset: u64, file_size: u64, vmaddr: u64, vmsize: u64) -> Segment {
+        Segment { name: "__TEXT".into(), address: vmaddr, memory_size: vmsize, file_offset, file_size, initial_protection: 0x5 }
+    }
+    #[test]
+    fn lc_main_resolves_file_offset_and_slide() {
+        assert_eq!(resolve_main_entry(&text(0, 0x3000, 0x1_0000_0000, 0x3000), 0x1234, 0x4000).unwrap(), 0x1_0000_5234);
+    }
+    #[test]
+    fn lc_main_handles_nonzero_text_file_offset() {
+        assert_eq!(resolve_main_entry(&text(0x1000, 0x3000, 0x1_0000_0000, 0x3000), 0x1234, 0).unwrap(), 0x1_0000_0234);
+    }
+    #[test]
+    fn lc_main_rejects_offsets_outside_file_backed_executable_text() {
+        let t = text(0, 0x1000, 0x1_0000_0000, 0x3000);
+        assert!(matches!(resolve_main_entry(&t, 0x1000, 0), Err(MachOError::EntryPointOutsideText)));
+        assert!(matches!(resolve_main_entry(&t, 0x2000, 0), Err(MachOError::EntryPointOutsideText)));
+    }
+    #[test]
+    fn lc_main_rejects_non_executable_text() {
+        let mut t = text(0, 0x3000, 0x1_0000_0000, 0x3000);
+        t.initial_protection = 0x3;
+        assert!(matches!(resolve_main_entry(&t, 0x100, 0), Err(MachOError::EntryPointOutsideText)));
     }
 }
