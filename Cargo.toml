@@ -25,6 +25,11 @@ crate-type = ["cdylib", "rlib"]
 name = "touchHLE"
 path = "src/bin.rs"
 
+[[bin]]
+name = "arm64-probe"
+path = "src/bin/arm64_probe.rs"
+required-features = ["arm64-probe"]
+
 [features]
 default = ["static"]
 static = [
@@ -37,6 +42,7 @@ static = [
 # supplied by the host. The iOS host app loads a core as a dylib at runtime, and
 # SDL owns the process entry point and the UIApplicationDelegate, so the app and
 # the core have to be the same SDL — a core cannot bring its own copy.
+arm64-probe = []
 dynamic-sdl = [
     "touchHLE_openal_soft_wrapper/static",
     "touchHLE_libxml2_wrapper/static",

@@ -29,6 +29,7 @@ mod log;
 mod env_flags;
 mod fastmap;
 mod abi;
+pub mod arm64;
 mod android_jni;
 mod android_media;
 mod android_web_view;
