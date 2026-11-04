@@ -3,10 +3,12 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/.
  */
-//! AArch64 dynamic-linker stub instruction helpers.
+//! AArch64 dynamic-linker support primitives.
 //!
-//! These encode the minimal SVC/RET bridge. Symbol resolution and framework
-//! dispatch remain separate work because the current dyld dispatcher is A32.
+//! This module contains export-trie and chained-import decoding, a dependency
+//! registry/graph loader, and minimal SVC/RET bridge encoders. Full dyld
+//! compatibility (notably ObjC metadata, all fixup formats, and frameworks)
+//! is still outside the current experimental implementation.
 
 use super::memory::{GuestAddr, GuestMemory, MemoryError};
 use std::convert::TryInto;
