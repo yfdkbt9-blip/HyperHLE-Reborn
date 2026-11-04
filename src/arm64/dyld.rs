@@ -278,6 +278,26 @@ pub fn resolve_dylib_candidates(install_name: &str, loader_path: &str, executabl
     candidates
 }
 
+/// Read a resolved candidate from an IPA ZIP. Candidate paths are expected
+/// to be bundle-relative (for example Payload/Game.app/Frameworks/Foo.framework/Foo).
+/// System frameworks are not normally shipped in an IPA and must be supplied by
+/// the emulator's separate iOS runtime/shared-cache provider.
+pub fn read_dylib_from_ipa<R: std::io::Read + std::io::Seek>(
+    archive: &mut zip::ZipArchive<R>,
+    candidate: &str,
+) -> Result<Option<Vec<u8>>, String> {
+    let archive_path = candidate.trim_start_matches('/');
+    match archive.by_name(archive_path) {
+        Ok(mut file) => {
+            let mut bytes = Vec::new();
+            file.read_to_end(&mut bytes).map_err(|error| error.to_string())?;
+            Ok(Some(bytes))
+        }
+        Err(zip::result::ZipError::FileNotFound) => Ok(None),
+        Err(error) => Err(error.to_string()),
+    }
+}
+
 /// Per-image dependency ordinals and globally loaded dylib exports.
 /// Ordinals are interpreted in the importing image's load-command order.
 #[derive(Clone, Debug, Default)]
