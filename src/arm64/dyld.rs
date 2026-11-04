@@ -117,7 +117,7 @@ mod tests {
 
     #[test]
     fn parses_chained_import_with_signed_ordinal_and_name() {
-        let mut payload=vec![0u8;28+4+8+5];
+        let mut payload=vec![0u8;38];
         payload[8..12].copy_from_slice(&28u32.to_le_bytes());
         payload[12..16].copy_from_slice(&32u32.to_le_bytes());
         payload[16..20].copy_from_slice(&1u32.to_le_bytes());
