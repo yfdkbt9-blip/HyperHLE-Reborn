@@ -14,6 +14,7 @@ pub const INTEGER_ARGUMENT_REGISTERS: usize = 8;
 pub const FLOAT_ARGUMENT_REGISTERS: usize = 8;
 pub const FRAME_POINTER_REGISTER: usize = 29;
 pub const LINK_REGISTER: usize = 30;
+pub const INDIRECT_RESULT_REGISTER: usize = 8;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct GuestFunction(pub GuestAddr);
@@ -34,6 +35,16 @@ pub struct IntegerArguments<'a> {
 impl<'a> IntegerArguments<'a> {
     pub fn new(context: &'a CpuContext, memory: &'a GuestMemory) -> Self {
         Self { context, memory, register_index: 0, stack_offset: 0 }
+    }
+
+    /// Read the next 32-bit integer argument. Each argument consumes one
+    /// general-purpose register slot; stack arguments occupy an 8-byte slot.
+    pub fn next_u32(&mut self) -> Result<u32, MemoryError> {
+        self.next_u64().map(|value| value as u32)
+    }
+
+    pub fn next_pointer(&mut self) -> Result<GuestAddr, MemoryError> {
+        self.next_u64()
     }
 
     /// Read the next 64-bit integer/pointer argument. X0-X7 are used first;
@@ -82,6 +93,11 @@ impl<'a> FloatingArguments<'a> {
     }
 }
 
+/// Pass the address of caller-allocated storage for an indirect aggregate result.
+pub fn set_indirect_result(context: &mut CpuContext, address: GuestAddr) {
+    context.x[INDIRECT_RESULT_REGISTER] = address;
+}
+
 /// AAPCS64 integer return values use X0 and, for a two-word result, X1.
 pub fn set_integer_return(context: &mut CpuContext, low: u64, high: Option<u64>) {
     context.x[0] = low;
@@ -121,4 +137,21 @@ mod tests {
         assert_eq!(args.next_f64(), Some(1.5));
         assert_eq!(args.next_f64(), Some(2.5));
     }
+    #[test]
+    fn supports_u32_arguments_and_indirect_aggregate_result_register() {
+        let mut memory = GuestMemory::new();
+        memory.map_zeroed(0x1_0000_0000, PAGE_SIZE as u64).unwrap();
+        memory.write(0x1_0000_0000, &0x1234_5678_9ABC_DEF0u64.to_le_bytes()).unwrap();
+        let mut context = CpuContext::default();
+        context.x[0] = 0xFFFF_FFFF_1234_5678;
+        context.sp = 0x1_0000_0000;
+        let mut args = IntegerArguments::new(&context, &memory);
+        assert_eq!(args.next_u32().unwrap(), 0x1234_5678);
+        for _ in 0..7 { args.next_u64().unwrap(); }
+        assert_eq!(args.next_u32().unwrap(), 0x9ABC_DEF0u32);
+        set_indirect_result(&mut context, 0x1_0000_1234);
+        assert_eq!(context.x[8], 0x1_0000_1234);
+    }
+
+
 }
