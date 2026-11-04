@@ -3,8 +3,9 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/.
  */
-//! Minimal 64-bit Mach-O image loader for the isolated A64 runtime.
-//! Dyld fixups and LC_UNIXTHREAD remain explicit follow-up work.
+//! 64-bit Mach-O image loader for the isolated A64 runtime.
+//! Generic DYLD_CHAINED_PTR_64_OFFSET rebases/binds are supported, including
+//! multi-start pages. ARM64e/PAC pointer formats and LC_UNIXTHREAD remain TODO.
 
 use super::memory::{GuestAddr, GuestMemory, MemoryError};
 use mach_object::{LoadCommand, MachCommand, OFile, CPU_TYPE_ARM64};
@@ -207,7 +208,8 @@ fn chained_page_starts(payload: &[u8], info: usize, info_size: usize, page_count
 }
 
 /// Apply rebases for DYLD_CHAINED_PTR_64_OFFSET (generic arm64 format).
-/// Bind pointers and arm64e/PAC formats are intentionally rejected.
+/// Bind pointers are handled by `apply_chained_binds`; ARM64e/PAC formats
+/// are intentionally rejected until their pointer-authentication metadata is modeled.
 fn apply_chained_rebases(payload: &[u8], segments: &[Segment], image_base: GuestAddr, slide: GuestAddr, memory: &mut GuestMemory) -> Result<(), MachOError> {
     fn u16_at(d: &[u8], p: usize) -> Result<u16, MachOError> { let b=d.get(p..p.checked_add(2).ok_or(MachOError::InvalidChainedFixups)?).ok_or(MachOError::InvalidChainedFixups)?; Ok(u16::from_le_bytes([b[0],b[1]])) }
     fn u32_at(d: &[u8], p: usize) -> Result<u32, MachOError> { let b=d.get(p..p.checked_add(4).ok_or(MachOError::InvalidChainedFixups)?).ok_or(MachOError::InvalidChainedFixups)?; Ok(u32::from_le_bytes([b[0],b[1],b[2],b[3]])) }
