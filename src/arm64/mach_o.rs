@@ -249,11 +249,18 @@ fn apply_chained_rebases(payload: &[u8], segments: &[Segment], image_base: Guest
                 if loc.checked_add(8).ok_or(MachOError::AddressOverflow)?>page_end { return Err(MachOError::InvalidChainedFixups); }
                 let mut bytes=[0u8;8]; memory.read(loc,&mut bytes)?;
                 let raw=u64::from_le_bytes(bytes);
-                let next=(raw>>51)&0x7FF;
-                let is_bind = raw & (1u64<<62) != 0;
-                let authenticated = raw & (1u64<<63) != 0;
+                let next = if format == 9 { (raw >> 51) & 0x7FF } else { (raw >> 51) & 0xFFF };
+                let is_bind = if format == 9 {
+                    raw & (1u64 << 62) != 0
+                } else {
+                    raw & (1u64 << 63) != 0
+                };
+                let authenticated = format == 9 && raw & (1u64 << 63) != 0;
                 if format == 9 {
-                    if is_bind { return Err(MachOError::UnsupportedChainedBind); }
+                    // Bind pointers are resolved in the later registry-aware pass.
+                    if is_bind {
+                        // Do not patch this word, but continue following its chain.
+                    } else {
                     // ARM64E_USERLAND rebase targets are image-relative offsets.
                     // Authenticated pointers retain their PAC metadata in the file,
                     // but this portable emulator writes the unsigned guest address.
@@ -265,8 +272,11 @@ fn apply_chained_rebases(payload: &[u8], segments: &[Segment], image_base: Guest
                         (resolved & 0x00FF_FFFF_FFFF_FFFF)|(high8<<56)
                     };
                     patches.push((loc,value.to_le_bytes()));
+                    }
                 } else {
-                    if is_bind { return Err(MachOError::UnsupportedChainedBind); }
+                    if is_bind {
+                        // Generic binds are handled after dependency resolution.
+                    } else {
                     if ((raw >> 44) & 0x7F) != 0 { return Err(MachOError::InvalidChainedFixups); }
                     let target=raw & ((1u64<<36)-1);
                     let high8=(raw>>36)&0xFF;
@@ -274,6 +284,7 @@ fn apply_chained_rebases(payload: &[u8], segments: &[Segment], image_base: Guest
                     if resolved>0x00FF_FFFF_FFFF_FFFF { return Err(MachOError::AddressOverflow); }
                     let value=(resolved & 0x00FF_FFFF_FFFF_FFFF)|(high8<<56);
                     patches.push((loc,value.to_le_bytes()));
+                    }
                 }
                 if next==0 { break; }
                 loc=loc.checked_add(next.checked_mul(stride).ok_or(MachOError::AddressOverflow)?).ok_or(MachOError::AddressOverflow)?;
