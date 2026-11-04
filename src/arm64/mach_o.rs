@@ -211,8 +211,6 @@ fn chained_page_starts(payload: &[u8], info: usize, info_size: usize, page_count
 fn apply_chained_rebases(payload: &[u8], segments: &[Segment], image_base: GuestAddr, slide: GuestAddr, memory: &mut GuestMemory) -> Result<(), MachOError> {
     fn u16_at(d: &[u8], p: usize) -> Result<u16, MachOError> { let b=d.get(p..p.checked_add(2).ok_or(MachOError::InvalidChainedFixups)?).ok_or(MachOError::InvalidChainedFixups)?; Ok(u16::from_le_bytes([b[0],b[1]])) }
     fn u32_at(d: &[u8], p: usize) -> Result<u32, MachOError> { let b=d.get(p..p.checked_add(4).ok_or(MachOError::InvalidChainedFixups)?).ok_or(MachOError::InvalidChainedFixups)?; Ok(u32::from_le_bytes([b[0],b[1],b[2],b[3]])) }
-    const START_NONE: u16 = 0xFFFF;
-    const START_MULTI: u16 = 0x8000;
     let starts=usize::try_from(u32_at(payload,4)?).map_err(|_|MachOError::InvalidChainedFixups)?;
     let count=usize::try_from(u32_at(payload,starts)?).map_err(|_|MachOError::InvalidChainedFixups)?;
     if count != segments.len() { return Err(MachOError::InvalidChainedFixups); }
@@ -740,6 +738,20 @@ mod tests {
         let mut resolved = [0u8; 8];
         memory.read(0x1_0000_0008, &mut resolved).unwrap();
         assert_eq!(u64::from_le_bytes(resolved), 0x9000);
+    }
+
+    #[test]
+    fn decodes_multiple_chained_starts_from_overflow_array() {
+        // starts-in-segment: 22-byte header, two page entries, then two overflow entries.
+        let mut payload = vec![0u8; 30];
+        payload[0..4].copy_from_slice(&30u32.to_le_bytes());
+        payload[22..24].copy_from_slice(&0x8002u16.to_le_bytes());
+        payload[24..26].copy_from_slice(&0xFFFFu16.to_le_bytes());
+        payload[26..28].copy_from_slice(&0x0010u16.to_le_bytes());
+        payload[28..30].copy_from_slice(&0x8020u16.to_le_bytes());
+        assert_eq!(chained_page_starts(&payload, 0, 30, 2, 0x8002).unwrap(), vec![0x10, 0x20]);
+        assert!(matches!(chained_page_starts(&payload, 0, 26, 2, 0x8002), Err(MachOError::InvalidChainedFixups)));
+        assert!(matches!(chained_page_starts(&payload, 0, 30, 2, 0x8001), Err(MachOError::InvalidChainedFixups)));
     }
 
 }
