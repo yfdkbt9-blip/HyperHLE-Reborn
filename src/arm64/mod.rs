@@ -6,5 +6,7 @@
 //! Experimental AArch64 guest runtime, isolated from the existing A32 path.
 
 pub mod memory;
-\npub mod cpu;\npub mod mach_o;
+pub mod cpu;
+pub mod abi;
+pub mod mach_o;
 pub mod dyld;
