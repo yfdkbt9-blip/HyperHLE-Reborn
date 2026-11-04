@@ -485,10 +485,9 @@ impl DylibRegistry {
                     }
                     None => return Err(DylibRegistryError::MissingRequiredDependency(dependency.install_name.clone())),
                 };
-                let mut child_memory = memory;
-                let child = super::mach_o::MachOImage::load(&bytes, &mut child_memory, 0)
+                let child = super::mach_o::MachOImage::load(&bytes, &mut *memory, 0)
                     .map_err(|_| DylibRegistryError::DependencyParseFailed(dependency.install_name.clone()))?;
-                let child_id = visit(registry, dependency.install_name.clone(), child, child_memory, resolve_file, false)?;
+                let child_id = visit(registry, dependency.install_name.clone(), child, memory, resolve_file, false)?;
                 linked.push(Some(child_id));
             }
             registry.dependencies.insert(id, linked);
