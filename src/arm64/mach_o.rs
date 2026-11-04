@@ -27,6 +27,8 @@ pub struct MachOImage {
     pub dynamic_libraries: Vec<String>,
     /// Raw LC_DYLD_CHAINED_FIXUPS payload. Parsed separately by the A64 dyld layer.
     pub chained_fixups: Option<Vec<u8>>,
+    /// Raw LC_DYLD_EXPORTS_TRIE payload, decoded by the A64 dyld layer.
+    pub exports_trie: Option<Vec<u8>>,
     pub text_base: GuestAddr,
     pub end_address: GuestAddr,
 }
@@ -34,8 +36,8 @@ pub struct MachOImage {
 #[derive(Debug)]
 pub enum MachOError {
     Parse, WrongArchitecture, UnsupportedSubtype, MissingTextSegment,
-    DuplicateTextSegment, DuplicateChainedFixups, MissingEntryPoint, EntryPointOutsideText,
-    InvalidSegmentRange, InvalidChainedFixups, UnsupportedPointerFormat, UnsupportedChainedBind, OverlappingSegments, AddressOverflow, Memory(MemoryError),
+    DuplicateTextSegment, DuplicateChainedFixups, DuplicateExportsTrie, ConflictingExportsTrieCommands, MissingEntryPoint, EntryPointOutsideText,
+    InvalidSegmentRange, InvalidChainedFixups, InvalidExportsTrie, UnsupportedPointerFormat, UnsupportedChainedBind, OverlappingSegments, AddressOverflow, Memory(MemoryError),
 }
 impl From<MemoryError> for MachOError {
     fn from(value: MemoryError) -> Self { Self::Memory(value) }
@@ -233,6 +235,7 @@ impl MachOImage {
         let mut entry_offset = None;
         let mut dynamic_libraries = Vec::new();
         let mut chained_fixups = None;
+        let mut exports_trie = None;
         for MachCommand(command, _) in &commands {
             match command {
                 LoadCommand::Segment64 { segname, vmaddr, vmsize, fileoff, filesize, initprot, .. } => {
@@ -261,6 +264,26 @@ impl MachOImage {
                     let payload = image_bytes.get(start..finish).ok_or(MachOError::InvalidSegmentRange)?;
                     validate_chained_fixups(payload)?;
                     chained_fixups = Some(payload.to_vec());
+                }
+                LoadCommand::DyldExportsTrie(data) => {
+                    if exports_trie.is_some() { return Err(MachOError::DuplicateExportsTrie); }
+                    let start = usize::try_from(data.off).map_err(|_| MachOError::InvalidSegmentRange)?;
+                    let size = usize::try_from(data.size).map_err(|_| MachOError::InvalidSegmentRange)?;
+                    let finish = start.checked_add(size).ok_or(MachOError::InvalidSegmentRange)?;
+                    let payload = image_bytes.get(start..finish).ok_or(MachOError::InvalidSegmentRange)?;
+                    super::dyld::parse_export_trie(payload)
+                        .map_err(|_| MachOError::InvalidExportsTrie)?;
+                    exports_trie = Some(payload.to_vec());
+                }
+                LoadCommand::DyldInfo { export_off, export_size, .. } if *export_size != 0 => {
+                    if exports_trie.is_some() { return Err(MachOError::ConflictingExportsTrieCommands); }
+                    let start = usize::try_from(*export_off).map_err(|_| MachOError::InvalidSegmentRange)?;
+                    let size = usize::try_from(*export_size).map_err(|_| MachOError::InvalidSegmentRange)?;
+                    let finish = start.checked_add(size).ok_or(MachOError::InvalidSegmentRange)?;
+                    let payload = image_bytes.get(start..finish).ok_or(MachOError::InvalidSegmentRange)?;
+                    super::dyld::parse_export_trie(payload)
+                        .map_err(|_| MachOError::InvalidExportsTrie)?;
+                    exports_trie = Some(payload.to_vec());
                 }
                 LoadCommand::LoadDyLib(dylib) => dynamic_libraries.push(dylib.name.to_string()),
                 LoadCommand::LoadWeakDyLib(dylib) => dynamic_libraries.push(dylib.name.to_string()),
@@ -310,7 +333,7 @@ impl MachOImage {
             let image_base = text_base.checked_sub(slide).ok_or(MachOError::AddressOverflow)?;
             apply_chained_rebases(payload, &segments, image_base, slide, memory)?;
         }
-        Ok(Self { segments, entry_point, dynamic_libraries, chained_fixups, text_base, end_address })
+        Ok(Self { segments, entry_point, dynamic_libraries, chained_fixups, exports_trie, text_base, end_address })
     }
 }
 
