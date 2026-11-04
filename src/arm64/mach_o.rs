@@ -430,7 +430,7 @@ where
                                 let bits = ((raw >> 32) & 0x7_FFFF) as i64;
                                 if bits & 0x4_0000 != 0 { bits | !0x7_FFFF } else { bits }
                             };
-                            (ordinal, addend)
+                            (ordinal, Some(addend))
                         } else {
                             let ordinal = usize::try_from(raw & 0x00FF_FFFF)
                                 .map_err(|_| MachOError::InvalidImportOrdinal)?;
@@ -438,7 +438,7 @@ where
                             let embedded_reserved = (raw >> 32) & 0x7_FFFF;
                             if embedded_reserved != 0 { return Err(MachOError::InvalidChainedFixups); }
                             // Generic 64-bit inline addend replaces the import addend.
-                            (ordinal, if inline_addend != 0 { i64::from(inline_addend) } else { i64::MIN })
+                            (ordinal, if inline_addend != 0 { Some(i64::from(inline_addend)) } else { None })
                         };
                         let import = imports.get(ordinal).ok_or(MachOError::InvalidImportOrdinal)?;
                         let symbol = match resolve(import) {
@@ -447,12 +447,10 @@ where
                             None => return Err(MachOError::UnresolvedStrongImport(import.symbol.clone())),
                         };
                         let total_addend = if pointer_format == 9 {
-                            import.addend.checked_add(embedded_addend)
+                            import.addend.checked_add(embedded_addend.unwrap_or(0))
                                 .ok_or(MachOError::BindAddendOverflow)?
-                        } else if embedded_addend == i64::MIN {
-                            import.addend
                         } else {
-                            embedded_addend
+                            embedded_addend.unwrap_or(import.addend)
                         };
                         // Authenticated binds are emitted as unsigned guest pointers.
                         // PAC key/diversity/address-diversity metadata is not emulated.
