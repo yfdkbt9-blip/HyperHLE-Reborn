@@ -952,7 +952,7 @@ mod tests {
             entry_point: 0,
             dynamic_libraries: vec![],
             dependencies: vec![], rpaths: vec![],
-            chained_fixups: None,
+            chained_fixups: None, classic_dyld_info: None,
             // Root edge "_foo" -> terminal exporting text-relative address 0x1234.
             exports_trie: Some(vec![0, 1, b'_', b'f', b'o', b'o', 0, 8, 2, 0, 0xB4, 0x24, 0]),
             text_base: 0x1_0000_0000,
@@ -972,7 +972,7 @@ mod tests {
             dynamic_libraries: vec![],
             dependencies: vec![],
             rpaths: vec![],
-            chained_fixups: None,
+            chained_fixups: None, classic_dyld_info: None,
             exports_trie: None,
             text_base: 0x1_0000_0000,
             end_address: 0,
