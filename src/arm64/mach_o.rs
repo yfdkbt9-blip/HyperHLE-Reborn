@@ -533,4 +533,67 @@ mod tests {
         t.initial_protection = 0x3;
         assert!(matches!(resolve_main_entry(&t, 0x100, 0), Err(MachOError::EntryPointOutsideText)));
     }
+    fn bind_test_image() -> (MachOImage, GuestMemory) {
+        let mut payload = vec![0u8; 68];
+        payload[4..8].copy_from_slice(&28u32.to_le_bytes());
+        payload[8..12].copy_from_slice(&60u32.to_le_bytes());
+        payload[12..16].copy_from_slice(&64u32.to_le_bytes());
+        payload[16..20].copy_from_slice(&1u32.to_le_bytes());
+        payload[20..24].copy_from_slice(&1u32.to_le_bytes());
+        payload[24..28].copy_from_slice(&0u32.to_le_bytes());
+        payload[28..32].copy_from_slice(&1u32.to_le_bytes());
+        payload[32..36].copy_from_slice(&8u32.to_le_bytes());
+        payload[36..40].copy_from_slice(&24u32.to_le_bytes());
+        payload[40..42].copy_from_slice(&0x1000u16.to_le_bytes());
+        payload[42..44].copy_from_slice(&6u16.to_le_bytes());
+        payload[48..56].copy_from_slice(&0u64.to_le_bytes());
+        payload[56..58].copy_from_slice(&1u16.to_le_bytes());
+        payload[58..60].copy_from_slice(&0u16.to_le_bytes());
+        payload[60..64].copy_from_slice(&1u32.to_le_bytes());
+        payload[64..68].copy_from_slice(b"sym\0");
+        let segment = Segment {
+            name: "__DATA".into(), address: 0x1_0000_0000, memory_size: 0x1000,
+            file_offset: 0, file_size: 0x1000, initial_protection: 3,
+        };
+        let image = MachOImage {
+            segments: vec![segment], entry_point: 0, dynamic_libraries: vec![],
+            chained_fixups: Some(payload), exports_trie: None,
+            text_base: 0x1_0000_0000, end_address: 0x1_0000_1000,
+        };
+        let mut memory = GuestMemory::new();
+        memory.map_zeroed(0x1_0000_0000, 0x1000).unwrap();
+        (image, memory)
+    }
+
+    #[test]
+    fn applies_chained_bind_using_resolved_symbol_address() {
+        let (image, mut memory) = bind_test_image();
+        memory.write(0x1_0000_0000, &(1u64 << 63).to_le_bytes()).unwrap();
+        apply_chained_binds(&image, &mut memory, |import| {
+            assert_eq!(import.symbol, "sym");
+            Some(0x1_2345_6780)
+        }).unwrap();
+        let mut actual = [0u8; 8];
+        memory.read(0x1_0000_0000, &mut actual).unwrap();
+        assert_eq!(u64::from_le_bytes(actual), 0x1_2345_6780);
+    }
+
+    #[test]
+    fn chained_bind_walk_continues_after_rebase_and_stages_writes() {
+        let (image, mut memory) = bind_test_image();
+        memory.write(0x1_0000_0000, &(2u64 << 51).to_le_bytes()).unwrap();
+        memory.write(0x1_0000_0008, &(1u64 << 63).to_le_bytes()).unwrap();
+        assert!(matches!(
+            apply_chained_binds(&image, &mut memory, |_| None),
+            Err(MachOError::UnresolvedStrongImport(_))
+        ));
+        let mut unchanged = [0u8; 8];
+        memory.read(0x1_0000_0008, &mut unchanged).unwrap();
+        assert_eq!(u64::from_le_bytes(unchanged), 1u64 << 63);
+        apply_chained_binds(&image, &mut memory, |_| Some(0x9000)).unwrap();
+        let mut resolved = [0u8; 8];
+        memory.read(0x1_0000_0008, &mut resolved).unwrap();
+        assert_eq!(u64::from_le_bytes(resolved), 0x9000);
+    }
+
 }
