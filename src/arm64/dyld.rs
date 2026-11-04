@@ -566,4 +566,38 @@ mod tests {
         assert_eq!(registry.resolve(first, &import), Err(DylibRegistryError::ReexportCycle));
     }
 
+    #[test]
+    fn links_dependencies_in_load_command_order_and_keeps_weak_slots() {
+        use super::super::mach_o::{DylibDependency, DylibDependencyKind};
+        let mut registry = DylibRegistry::new();
+        let app = registry.register_image("/App", true).unwrap();
+        let second = registry.register_image("/lib/Second.dylib", false).unwrap();
+        registry.add_export(second, "_second", 0x2222).unwrap();
+        let deps = vec![
+            DylibDependency { install_name: "/lib/Optional.dylib".into(), kind: DylibDependencyKind::Weak },
+            DylibDependency { install_name: "/lib/Second.dylib".into(), kind: DylibDependencyKind::Required },
+        ];
+        registry.link_image_dependencies(app, &deps).unwrap();
+        let absent = ChainedImport { library_ordinal: 1, weak: true, symbol: "_optional".into(), addend: 0 };
+        let present = ChainedImport { library_ordinal: 2, weak: false, symbol: "_second".into(), addend: 0 };
+        assert_eq!(registry.resolve(app, &absent).unwrap(), None);
+        assert_eq!(registry.resolve(app, &present).unwrap(), Some(0x2222));
+    }
+
+    #[test]
+    fn required_dependency_linking_fails_without_replacing_existing_order() {
+        use super::super::mach_o::{DylibDependency, DylibDependencyKind};
+        let mut registry = DylibRegistry::new();
+        let app = registry.register_image("/App", true).unwrap();
+        let lib = registry.register_image("/lib/Present.dylib", false).unwrap();
+        registry.add_dependency(app, lib).unwrap();
+        let missing = [DylibDependency { install_name: "/lib/Missing.dylib".into(), kind: DylibDependencyKind::Required }];
+        assert_eq!(
+            registry.link_image_dependencies(app, &missing),
+            Err(DylibRegistryError::MissingRequiredDependency("/lib/Missing.dylib".into()))
+        );
+        let old = ChainedImport { library_ordinal: 1, weak: false, symbol: "_x".into(), addend: 0 };
+        assert_eq!(registry.resolve(app, &old).unwrap(), None);
+    }
+
 }
