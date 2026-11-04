@@ -36,7 +36,7 @@ impl Cpu {
     pub fn new(memory: &mut GuestMemory) -> Self {
         let raw = unsafe { touchHLE_A64_new((memory as *mut GuestMemory).cast()) };
         assert!(!raw.is_null(), "Dynarmic A64 failed to create CPU");
-        Self { raw }
+        Self { raw, _memory: std::marker::PhantomData }
     }
 
     pub fn set_context(&mut self, context: &CpuContext) {
@@ -76,7 +76,7 @@ impl Cpu {
     }
 }
 
-impl Drop for Cpu {
+impl Drop for Cpu<'_> {
     fn drop(&mut self) {
         unsafe { touchHLE_A64_delete(self.raw); }
     }
