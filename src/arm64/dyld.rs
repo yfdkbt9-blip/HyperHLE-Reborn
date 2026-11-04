@@ -448,6 +448,37 @@ impl DylibRegistry {
         result
     }
 
+    fn find_weak_in(
+        &self,
+        image_id: usize,
+        name: &str,
+        active: &mut std::collections::HashSet<(usize, String)>,
+        depth: usize,
+    ) -> Result<Option<GuestAddr>, DylibRegistryError> {
+        if depth > 128 { return Err(DylibRegistryError::ReexportDepthExceeded); }
+        let key = (image_id, name.to_owned());
+        if !active.insert(key.clone()) { return Err(DylibRegistryError::ReexportCycle); }
+        let result = match self.images.get(image_id).and_then(|image| image.exports.get(name)) {
+            None => Ok(None),
+            Some(RegistryExport::Address { address, weak_definition }) => {
+                Ok(if *weak_definition { Some(*address) } else { None })
+            }
+            Some(RegistryExport::Reexport { library_ordinal, imported_name }) => {
+                let dependencies = self.dependencies.get(&image_id).ok_or(
+                    DylibRegistryError::InvalidReexportOrdinal(*library_ordinal)
+                )?;
+                let dependency_id = library_ordinal.checked_sub(1)
+                    .and_then(|index| usize::try_from(index).ok())
+                    .and_then(|index| dependencies.get(index).copied().flatten())
+                    .ok_or(DylibRegistryError::InvalidReexportOrdinal(*library_ordinal))?;
+                let forwarded_name = if imported_name.is_empty() { name } else { imported_name.as_str() };
+                self.find_weak_in(dependency_id, forwarded_name, active, depth + 1)
+            }
+        };
+        active.remove(&key);
+        result
+    }
+
     fn find_in(&self, image: usize, name: &str) -> Result<Option<GuestAddr>, DylibRegistryError> {
         self.resolve_in(image, name, &mut std::collections::HashSet::new(), 0)
     }
@@ -471,9 +502,14 @@ impl DylibRegistry {
                 Ok(None)
             }
             -3 => {
-                for image in &self.images {
-                    if let Some(RegistryExport::Address { address, weak_definition: true }) = image.exports.get(&import.symbol) {
-                        return Ok(Some(*address));
+                for image_id in 0..self.images.len() {
+                    if let Some(address) = self.find_weak_in(
+                        image_id,
+                        &import.symbol,
+                        &mut std::collections::HashSet::new(),
+                        0,
+                    )? {
+                        return Ok(Some(address));
                     }
                 }
                 Ok(None)
@@ -928,6 +964,26 @@ mod tests {
         registry.add_weak_export(weak, "_symbol", 0x2000).unwrap();
         let weak_lookup = ChainedImport { library_ordinal: -3, weak: false, symbol: "_symbol".into(), addend: 0 };
         assert_eq!(registry.resolve(app, &weak_lookup).unwrap(), Some(0x2000));
+    }
+
+    #[test]
+    fn weak_lookup_follows_reexports_to_weak_definitions() {
+        let mut registry = DylibRegistry::new();
+        let importer = registry.register_image("/App", true).unwrap();
+        let facade = registry.register_image("/usr/lib/libFacade.dylib", false).unwrap();
+        let provider = registry.register_image("/usr/lib/libProvider.dylib", false).unwrap();
+        registry.add_dependency(importer, facade).unwrap();
+        registry.add_dependency(facade, provider).unwrap();
+        registry.add_reexport(facade, "_weak_api", 1, "").unwrap();
+        registry.add_weak_export(provider, "_weak_api", 0x5150).unwrap();
+
+        let weak = ChainedImport {
+            library_ordinal: -3,
+            weak: true,
+            symbol: "_weak_api".into(),
+            addend: 0,
+        };
+        assert_eq!(registry.resolve(importer, &weak).unwrap(), Some(0x5150));
     }
 
     #[test]
