@@ -146,7 +146,7 @@ mod tests {
         addend64[12..16].copy_from_slice(&44u32.to_le_bytes());
         addend64[16..20].copy_from_slice(&1u32.to_le_bytes());
         addend64[20..24].copy_from_slice(&3u32.to_le_bytes());
-        let import_word=3u64 | (1u64<<16) | (1u64<<32);
+        let import_word=3u64 | (1u64<<16);
         addend64[28..36].copy_from_slice(&import_word.to_le_bytes());
         addend64[36..44].copy_from_slice(&(-0x1234i64).to_le_bytes());
         addend64[44]=0;
