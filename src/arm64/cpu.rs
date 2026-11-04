@@ -30,18 +30,20 @@ pub enum StopReason {
 
 pub struct Cpu<'a> {
     raw: *mut std::ffi::c_void,
-    memory: &'a mut GuestMemory,
+    memory: std::ptr::NonNull<GuestMemory>,
+    _memory_lifetime: std::marker::PhantomData<&'a mut GuestMemory>,
 }
 
 impl<'a> Cpu<'a> {
     pub fn new(memory: &'a mut GuestMemory) -> Self {
-        let raw = unsafe { touchHLE_A64_new((memory as *mut GuestMemory).cast()) };
+        let memory = std::ptr::NonNull::from(memory);
+        let raw = unsafe { touchHLE_A64_new(memory.as_ptr().cast()) };
         assert!(!raw.is_null(), "Dynarmic A64 failed to create CPU");
-        Self { raw, memory }
+        Self { raw, memory, _memory_lifetime: std::marker::PhantomData }
     }
 
     /// Access guest memory between JIT runs (for loading, SVC dispatch, and debugging).
-    pub fn memory_mut(&mut self) -> &mut GuestMemory { self.memory }
+    pub fn memory_mut(&mut self) -> &mut GuestMemory { unsafe { self.memory.as_mut() } }
 
     pub fn set_context(&mut self, context: &CpuContext) {
         unsafe { touchHLE_A64_set_context(self.raw, context); }
@@ -54,7 +56,7 @@ impl<'a> Cpu<'a> {
         dispatcher: &mut super::svc::SvcDispatcher,
     ) -> Result<bool, String> {
         let mut context = self.get_context();
-        let handled = dispatcher.dispatch(immediate, &mut context, self.memory)?;
+        let handled = dispatcher.dispatch(immediate, &mut context, self.memory_mut())?;
         if handled { self.set_context(&context); }
         Ok(handled)
     }
