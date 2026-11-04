@@ -37,7 +37,8 @@ pub struct MachOImage {
 pub enum MachOError {
     Parse, WrongArchitecture, UnsupportedSubtype, MissingTextSegment,
     DuplicateTextSegment, DuplicateChainedFixups, DuplicateExportsTrie, ConflictingExportsTrieCommands, MissingEntryPoint, EntryPointOutsideText,
-    InvalidSegmentRange, InvalidChainedFixups, InvalidExportsTrie, UnsupportedPointerFormat, UnsupportedChainedBind, OverlappingSegments, AddressOverflow, Memory(MemoryError),
+    InvalidSegmentRange, InvalidChainedFixups, InvalidExportsTrie, UnsupportedPointerFormat, UnsupportedChainedBind, OverlappingSegments,
+    InvalidImportOrdinal, UnresolvedStrongImport(String), BindAddendOverflow, AddressOverflow, Memory(MemoryError),
 }
 impl From<MemoryError> for MachOError {
     fn from(value: MemoryError) -> Self { Self::Memory(value) }
@@ -215,6 +216,129 @@ fn apply_chained_rebases(payload: &[u8], segments: &[Segment], image_base: Guest
                 loc=loc.checked_add(next*4).ok_or(MachOError::AddressOverflow)?;
             }
         }
+    }
+    Ok(())
+}
+
+
+/// Resolve generic 64-bit chained binds. The resolver returns the absolute guest
+/// address of an imported symbol. Writes are staged so a missing strong symbol
+/// or malformed chain cannot leave guest memory half-patched.
+pub fn apply_chained_binds<F>(
+    image: &MachOImage,
+    memory: &mut GuestMemory,
+    mut resolve: F,
+) -> Result<(), MachOError>
+where
+    F: FnMut(&super::dyld::ChainedImport) -> Option<GuestAddr>,
+{
+    fn u16_at(data: &[u8], at: usize) -> Result<u16, MachOError> {
+        let end = at.checked_add(2).ok_or(MachOError::InvalidChainedFixups)?;
+        let b = data.get(at..end).ok_or(MachOError::InvalidChainedFixups)?;
+        Ok(u16::from_le_bytes([b[0], b[1]]))
+    }
+    fn u32_at(data: &[u8], at: usize) -> Result<u32, MachOError> {
+        let end = at.checked_add(4).ok_or(MachOError::InvalidChainedFixups)?;
+        let b = data.get(at..end).ok_or(MachOError::InvalidChainedFixups)?;
+        Ok(u32::from_le_bytes(b.try_into().map_err(|_| MachOError::InvalidChainedFixups)?))
+    }
+    let payload = match image.chained_fixups.as_deref() {
+        Some(data) => data,
+        None => return Ok(()),
+    };
+    let imports = super::dyld::parse_chained_imports(payload)
+        .map_err(|_| MachOError::InvalidChainedFixups)?;
+    let starts = usize::try_from(u32_at(payload, 4)?)
+        .map_err(|_| MachOError::InvalidChainedFixups)?;
+    let segment_count = usize::try_from(u32_at(payload, starts)?)
+        .map_err(|_| MachOError::InvalidChainedFixups)?;
+    if segment_count != image.segments.len() {
+        return Err(MachOError::InvalidChainedFixups);
+    }
+
+    let mut patches: Vec<(GuestAddr, [u8; 8])> = Vec::new();
+    for (segment_index, segment) in image.segments.iter().enumerate() {
+        let offset_pos = starts.checked_add(4)
+            .and_then(|v| v.checked_add(segment_index.checked_mul(4)?))
+            .ok_or(MachOError::InvalidChainedFixups)?;
+        let relative = usize::try_from(u32_at(payload, offset_pos)?)
+            .map_err(|_| MachOError::InvalidChainedFixups)?;
+        if relative == 0 { continue; }
+        let info = starts.checked_add(relative).ok_or(MachOError::InvalidChainedFixups)?;
+        let info_size = usize::try_from(u32_at(payload, info)?)
+            .map_err(|_| MachOError::InvalidChainedFixups)?;
+        let page_size = u64::from(u16_at(payload, info + 4)?);
+        let pointer_format = u16_at(payload, info + 6)?;
+        let segment_offset = u64::from_le_bytes(
+            payload.get(info + 8..info + 16).ok_or(MachOError::InvalidChainedFixups)?
+                .try_into().map_err(|_| MachOError::InvalidChainedFixups)?
+        );
+        let page_count = usize::from(u16_at(payload, info + 20)?);
+        if pointer_format != 6 { return Err(MachOError::UnsupportedPointerFormat); }
+        if page_size != 0x1000 && page_size != 0x4000 {
+            return Err(MachOError::InvalidChainedFixups);
+        }
+        let array_end = 22usize.checked_add(page_count.checked_mul(2)
+            .ok_or(MachOError::InvalidChainedFixups)?)
+            .ok_or(MachOError::InvalidChainedFixups)?;
+        if array_end > info_size { return Err(MachOError::InvalidChainedFixups); }
+        let expected_offset = segment.address.checked_sub(image.text_base)
+            .ok_or(MachOError::InvalidChainedFixups)?;
+        if segment_offset != expected_offset { return Err(MachOError::InvalidChainedFixups); }
+
+        let segment_end = segment.address.checked_add(segment.memory_size)
+            .ok_or(MachOError::AddressOverflow)?;
+        for page_index in 0..page_count {
+            let page_start = u16_at(payload, info + 22 + page_index * 2)?;
+            if page_start == 0xFFFF { continue; }
+            if page_start & 0x8000 != 0 {
+                return Err(MachOError::UnsupportedPointerFormat);
+            }
+            let page_base = segment.address.checked_add(
+                (page_index as u64).checked_mul(page_size)
+                    .ok_or(MachOError::AddressOverflow)?
+            ).ok_or(MachOError::AddressOverflow)?;
+            let page_end = page_base.checked_add(page_size)
+                .ok_or(MachOError::AddressOverflow)?.min(segment_end);
+            let mut location = page_base.checked_add(u64::from(page_start))
+                .ok_or(MachOError::AddressOverflow)?;
+            loop {
+                if location.checked_add(8).ok_or(MachOError::AddressOverflow)? > page_end {
+                    return Err(MachOError::InvalidChainedFixups);
+                }
+                let mut raw_bytes = [0u8; 8];
+                memory.read(location, &mut raw_bytes)?;
+                let raw = u64::from_le_bytes(raw_bytes);
+                if raw >> 63 == 0 { break; } // A rebase in the same chain is handled elsewhere.
+                let import_index = usize::try_from(raw & 0x00FF_FFFF)
+                    .map_err(|_| MachOError::InvalidImportOrdinal)?;
+                let import = imports.get(import_index).ok_or(MachOError::InvalidImportOrdinal)?;
+                let inline_addend = ((raw >> 24) & 0xFF) as u8 as i8 as i64;
+                let embedded_reserved = (raw >> 32) & 0x7_FFFF;
+                if embedded_reserved != 0 { return Err(MachOError::InvalidChainedFixups); }
+                let symbol = match resolve(import) {
+                    Some(address) => address,
+                    None if import.weak => 0,
+                    None => return Err(MachOError::UnresolvedStrongImport(import.symbol.clone())),
+                };
+                let total_addend = import.addend.checked_add(inline_addend)
+                    .ok_or(MachOError::BindAddendOverflow)?;
+                let value = if total_addend >= 0 {
+                    symbol.checked_add(total_addend as u64)
+                } else {
+                    symbol.checked_sub(total_addend.unsigned_abs())
+                }.ok_or(MachOError::BindAddendOverflow)?;
+                patches.push((location, value.to_le_bytes()));
+                let next = (raw >> 51) & 0xFFF;
+                if next == 0 { break; }
+                location = location.checked_add(next.checked_mul(4)
+                    .ok_or(MachOError::AddressOverflow)?)
+                    .ok_or(MachOError::AddressOverflow)?;
+            }
+        }
+    }
+    for (address, bytes) in patches {
+        memory.write(address, &bytes)?;
     }
     Ok(())
 }
