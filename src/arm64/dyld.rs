@@ -637,6 +637,81 @@ pub fn write_host_call_stub(
     memory.write(address, &instructions)
 }
 
+
+/// Classic LC_DYLD_INFO rebase records (segment index, segment-relative offset).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ClassicRebase { pub segment_index: usize, pub segment_offset: u64 }
+/// Classic dyld bind record.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ClassicBind {
+    pub segment_index: usize, pub segment_offset: u64, pub library_ordinal: i32,
+    pub symbol: String, pub weak_import: bool, pub addend: i64,
+}
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ClassicOpcodeError {
+    Truncated, InvalidUleb, InvalidSleb, InvalidUtf8, MissingSegment,
+    UnsupportedOpcode(u8), InvalidType(u8), InvalidOrdinal, OffsetOverflow, ExcessiveRecords,
+}
+fn classic_uleb(data:&[u8], cursor:&mut usize)->Result<u64,ClassicOpcodeError>{
+    let mut value=0u64;let mut shift=0u32;
+    loop { let b=*data.get(*cursor).ok_or(ClassicOpcodeError::Truncated)?;*cursor+=1;
+        let part=u64::from(b&0x7f);if shift>=64||(shift==63&&part>1){return Err(ClassicOpcodeError::InvalidUleb);}
+        value|=part<<shift;if b&0x80==0{return Ok(value);}shift+=7;if shift>=70{return Err(ClassicOpcodeError::InvalidUleb);}
+    }
+}
+fn classic_sleb(data:&[u8],cursor:&mut usize)->Result<i64,ClassicOpcodeError>{
+    let mut value=0u64;let mut shift=0u32;let mut b;
+    loop {b=*data.get(*cursor).ok_or(ClassicOpcodeError::Truncated)?;*cursor+=1;
+        let part=u64::from(b&0x7f);if shift>=64||(shift==63&&part!=0&&part!=0x7f){return Err(ClassicOpcodeError::InvalidSleb);}
+        value|=part<<shift;shift+=7;if b&0x80==0{break;}if shift>=70{return Err(ClassicOpcodeError::InvalidSleb);}
+    }
+    if shift<64&&b&0x40!=0{value|=(!0u64)<<shift;}Ok(value as i64)
+}
+fn classic_add_offset(offset:u64,delta:u64)->Result<u64,ClassicOpcodeError>{offset.checked_add(delta).ok_or(ClassicOpcodeError::OffsetOverflow)}
+
+/// Parse the classic rebase bytecode. Only pointer rebases are supported.
+pub fn parse_classic_rebases(data:&[u8])->Result<Vec<ClassicRebase>,ClassicOpcodeError>{
+    let(mut c,mut kind,mut seg,mut off)=(0usize,0u8,None,0u64);let mut out=Vec::new();
+    fn emit(seg:Option<usize>,off:u64,kind:u8,out:&mut Vec<ClassicRebase>)->Result<(),ClassicOpcodeError>{
+        if kind!=1{return Err(ClassicOpcodeError::InvalidType(kind));}
+        if out.len()>=1_000_000{return Err(ClassicOpcodeError::ExcessiveRecords);}
+        out.push(ClassicRebase{segment_index:seg.ok_or(ClassicOpcodeError::MissingSegment)?,segment_offset:off});Ok(())
+    }
+    while c<data.len(){let b=data[c];c+=1;let op=b&0xf0;let imm=b&0x0f;match op{
+        0x00=>break,0x10=>kind=imm,0x20=>{seg=Some(imm as usize);off=classic_uleb(data,&mut c)?;},
+        0x30=>off=classic_add_offset(off,classic_uleb(data,&mut c)?)?,0x40=>off=classic_add_offset(off,u64::from(imm)*8)?,
+        0x50=>for _ in 0..imm{emit(seg,off,kind,&mut out)?;off=classic_add_offset(off,8)?;},
+        0x60=>{let n=classic_uleb(data,&mut c)?;if n>1_000_000{return Err(ClassicOpcodeError::ExcessiveRecords);}for _ in 0..n{emit(seg,off,kind,&mut out)?;off=classic_add_offset(off,8)?;}},
+        0x70=>{emit(seg,off,kind,&mut out)?;off=classic_add_offset(off,8+classic_uleb(data,&mut c)?)?;},
+        0x80=>{let n=classic_uleb(data,&mut c)?;let skip=classic_uleb(data,&mut c)?;if n>1_000_000{return Err(ClassicOpcodeError::ExcessiveRecords);}for _ in 0..n{emit(seg,off,kind,&mut out)?;off=classic_add_offset(off,8+skip)?;}},
+        _=>return Err(ClassicOpcodeError::UnsupportedOpcode(op)),
+    }}Ok(out)
+}
+
+/// Parse regular, weak, or lazy classic dyld bind streams (64-bit pointer slots).
+pub fn parse_classic_binds(data:&[u8],weak_stream:bool,lazy_stream:bool)->Result<Vec<ClassicBind>,ClassicOpcodeError>{
+    let(mut c,mut ord,mut sym,mut weak,mut kind,mut add,mut seg,mut off)=(0usize,if weak_stream{-3}else{0},String::new(),false,1u8,0i64,None,0u64);
+    let mut out=Vec::new();
+    fn emit(seg:Option<usize>,off:u64,ord:i32,sym:&str,weak:bool,kind:u8,add:i64,out:&mut Vec<ClassicBind>)->Result<(),ClassicOpcodeError>{
+        if kind!=1{return Err(ClassicOpcodeError::InvalidType(kind));}if sym.is_empty(){return Err(ClassicOpcodeError::Truncated);}
+        if out.len()>=1_000_000{return Err(ClassicOpcodeError::ExcessiveRecords);}
+        out.push(ClassicBind{segment_index:seg.ok_or(ClassicOpcodeError::MissingSegment)?,segment_offset:off,library_ordinal:ord,symbol:sym.to_owned(),weak_import:weak,addend:add});Ok(())
+    }
+    while c<data.len(){let b=data[c];c+=1;let op=b&0xf0;let imm=b&0x0f;match op{
+        0x00=>{if lazy_stream{ord=0;sym.clear();weak=false;kind=1;add=0;seg=None;off=0;}else{break;}},
+        0x10=>ord=imm as i32,0x20=>ord=i32::try_from(classic_uleb(data,&mut c)?).map_err(|_|ClassicOpcodeError::InvalidOrdinal)?,
+        0x30=>ord=if imm==0{0}else{(imm as i8|0xf0) as i32},
+        0x40=>{weak=imm&1!=0;let tail=data.get(c..).ok_or(ClassicOpcodeError::Truncated)?;let nul=tail.iter().position(|x|*x==0).ok_or(ClassicOpcodeError::Truncated)?;sym=std::str::from_utf8(&tail[..nul]).map_err(|_|ClassicOpcodeError::InvalidUtf8)?.to_owned();c+=nul+1;},
+        0x50=>kind=imm,0x60=>add=classic_sleb(data,&mut c)?,0x70=>{seg=Some(imm as usize);off=classic_uleb(data,&mut c)?;},
+        0x80=>off=classic_add_offset(off,classic_uleb(data,&mut c)?)?,
+        0x90=>{emit(seg,off,ord,&sym,weak,kind,add,&mut out)?;off=classic_add_offset(off,8)?;},
+        0xa0=>{emit(seg,off,ord,&sym,weak,kind,add,&mut out)?;off=classic_add_offset(off,8+classic_uleb(data,&mut c)?)?;},
+        0xb0=>{emit(seg,off,ord,&sym,weak,kind,add,&mut out)?;off=classic_add_offset(off,u64::from(imm)*8+8)?;},
+        0xc0=>{let n=classic_uleb(data,&mut c)?;let skip=classic_uleb(data,&mut c)?;if n>1_000_000{return Err(ClassicOpcodeError::ExcessiveRecords);}for _ in 0..n{emit(seg,off,ord,&sym,weak,kind,add,&mut out)?;off=classic_add_offset(off,8+skip)?;}},
+        _=>return Err(ClassicOpcodeError::UnsupportedOpcode(op)),
+    }}Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
