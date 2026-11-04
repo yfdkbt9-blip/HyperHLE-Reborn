@@ -309,26 +309,32 @@ where
                 let mut raw_bytes = [0u8; 8];
                 memory.read(location, &mut raw_bytes)?;
                 let raw = u64::from_le_bytes(raw_bytes);
-                if raw >> 63 == 0 { break; } // A rebase in the same chain is handled elsewhere.
-                let import_index = usize::try_from(raw & 0x00FF_FFFF)
-                    .map_err(|_| MachOError::InvalidImportOrdinal)?;
-                let import = imports.get(import_index).ok_or(MachOError::InvalidImportOrdinal)?;
-                let inline_addend = ((raw >> 24) & 0xFF) as u8 as i8 as i64;
-                let embedded_reserved = (raw >> 32) & 0x7_FFFF;
-                if embedded_reserved != 0 { return Err(MachOError::InvalidChainedFixups); }
-                let symbol = match resolve(import) {
-                    Some(address) => address,
-                    None if import.weak => 0,
-                    None => return Err(MachOError::UnresolvedStrongImport(import.symbol.clone())),
-                };
-                let total_addend = import.addend.checked_add(inline_addend)
-                    .ok_or(MachOError::BindAddendOverflow)?;
-                let value = if total_addend >= 0 {
-                    symbol.checked_add(total_addend as u64)
-                } else {
-                    symbol.checked_sub(total_addend.unsigned_abs())
-                }.ok_or(MachOError::BindAddendOverflow)?;
-                patches.push((location, value.to_le_bytes()));
+                if raw >> 63 != 0 {
+                    let import_index = usize::try_from(raw & 0x00FF_FFFF)
+                        .map_err(|_| MachOError::InvalidImportOrdinal)?;
+                    let import = imports.get(import_index).ok_or(MachOError::InvalidImportOrdinal)?;
+                    let inline_addend = ((raw >> 24) & 0xFF) as u8;
+                    let embedded_reserved = (raw >> 32) & 0x7_FFFF;
+                    if embedded_reserved != 0 { return Err(MachOError::InvalidChainedFixups); }
+                    let symbol = match resolve(import) {
+                        Some(address) => address,
+                        None if import.weak => 0,
+                        None => return Err(MachOError::UnresolvedStrongImport(import.symbol.clone())),
+                    };
+                    // In the generic 64-bit bind encoding, a non-zero inline
+                    // addend replaces (rather than augments) the import addend.
+                    let total_addend = if inline_addend != 0 {
+                        i64::from(inline_addend)
+                    } else {
+                        import.addend
+                    };
+                    let value = if total_addend >= 0 {
+                        symbol.checked_add(total_addend as u64)
+                    } else {
+                        symbol.checked_sub(total_addend.unsigned_abs())
+                    }.ok_or(MachOError::BindAddendOverflow)?;
+                    patches.push((location, value.to_le_bytes()));
+                }
                 let next = (raw >> 51) & 0xFFF;
                 if next == 0 { break; }
                 location = location.checked_add(next.checked_mul(4)
