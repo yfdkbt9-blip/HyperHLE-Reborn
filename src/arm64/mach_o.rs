@@ -349,6 +349,42 @@ where
     Ok(())
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ExportResolveError {
+    UnsupportedExportKind,
+    AddressOverflow,
+}
+
+/// Resolve an export from this image. Re-exports are delegated to the caller
+/// so the image loader does not guess how a library ordinal maps to a loaded image.
+pub fn resolve_export<F>(
+    image: &MachOImage,
+    symbol_name: &str,
+    mut resolve_reexport: F,
+) -> Result<Option<GuestAddr>, ExportResolveError>
+where
+    F: FnMut(u64, &str) -> Option<GuestAddr>,
+{
+    let exports = image.exported_symbols().map_err(|_| ExportResolveError::UnsupportedExportKind)?;
+    let symbol = match exports.iter().find(|entry| entry.name == symbol_name) {
+        Some(symbol) => symbol,
+        None => return Ok(None),
+    };
+    match &symbol.kind {
+        super::dyld::ExportKind::Regular { address } => match symbol.flags & 0x03 {
+            0 => image.text_base.checked_add(*address).map(Some).ok_or(ExportResolveError::AddressOverflow),
+            2 => Ok(Some(*address)), // absolute symbol
+            _ => Err(ExportResolveError::UnsupportedExportKind), // thread-local/reserved
+        },
+        super::dyld::ExportKind::StubAndResolver { stub, .. } => {
+            image.text_base.checked_add(*stub).map(Some).ok_or(ExportResolveError::AddressOverflow)
+        }
+        super::dyld::ExportKind::Reexport { library_ordinal, imported_name } => {
+            Ok(resolve_reexport(*library_ordinal, if imported_name.is_empty() { symbol_name } else { imported_name }))
+        }
+    }
+}
+
 impl MachOImage {
     /// Decode the image's exported symbols, if it contains an export trie.
     pub fn exported_symbols(
