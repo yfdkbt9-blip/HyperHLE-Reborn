@@ -415,6 +415,32 @@ fn find_arm64_slice(file: &[u8]) -> Result<(usize, usize), String> {
     Ok((0, file.len()))
 }
 
+/// True if `file` is an executable whose only usable slice is arm64: a thin
+/// arm64 Mach-O, or a fat file that has an arm64 slice but no 32-bit ARM one.
+/// Only looks at headers, so it is cheap to call on any executable.
+pub fn is_arm64_only(file: &[u8]) -> bool {
+    const CPU_TYPE_ARM: u32 = 12;
+    if let Ok(FAT_MAGIC) = be_u32(file, 0) {
+        let n = match be_u32(file, 4) {
+            Ok(n) => n.min(32) as usize,
+            Err(_) => return false,
+        };
+        let (mut has_arm64, mut has_arm32) = (false, false);
+        for i in 0..n {
+            match be_u32(file, 8 + i * 20) {
+                Ok(CPU_TYPE_ARM64) => has_arm64 = true,
+                Ok(CPU_TYPE_ARM) => has_arm32 = true,
+                _ => {}
+            }
+        }
+        return has_arm64 && !has_arm32;
+    }
+    matches!(
+        (rd_u32(file, 0), rd_u32(file, 4)),
+        (Ok(MH_MAGIC_64), Ok(CPU_TYPE_ARM64))
+    )
+}
+
 impl MachO64 {
     pub fn load_from_bytes(file: &[u8], name: String) -> Result<MachO64, String> {
         let (image_offset, image_len) = find_arm64_slice(file)?;
@@ -779,6 +805,28 @@ mod tests {
         fn write_u64(&mut self, a: u64, v: u64) -> bool {
             self.write_bytes(a, &v.to_le_bytes())
         }
+    }
+
+    #[test]
+    fn detects_arm64_only_executables() {
+        // thin arm64
+        assert!(is_arm64_only(&[0xcf, 0xfa, 0xed, 0xfe, 0x0c, 0, 0, 1]));
+        // thin 32-bit ARM
+        assert!(!is_arm64_only(&[0xce, 0xfa, 0xed, 0xfe, 0x0c, 0, 0, 0]));
+        assert!(!is_arm64_only(&[]));
+        // fat files: (cputype) list -> header bytes
+        let fat = |types: &[u32]| {
+            let mut v = vec![0xca, 0xfe, 0xba, 0xbe];
+            v.extend_from_slice(&(types.len() as u32).to_be_bytes());
+            for t in types {
+                v.extend_from_slice(&t.to_be_bytes());
+                v.extend_from_slice(&[0u8; 16]);
+            }
+            v
+        };
+        assert!(is_arm64_only(&fat(&[CPU_TYPE_ARM64])));
+        assert!(!is_arm64_only(&fat(&[12, CPU_TYPE_ARM64])));
+        assert!(!is_arm64_only(&fat(&[12])));
     }
 
     #[test]
