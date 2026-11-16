@@ -47,6 +47,7 @@ mod gles;
 mod image;
 mod libc;
 mod mach_o;
+mod mach_o64;
 mod matrix;
 mod mem;
 mod objc;
