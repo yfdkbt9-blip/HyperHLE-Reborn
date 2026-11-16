@@ -46,7 +46,8 @@ fn main() {
 
     let mut build = cmake::Config::new(&dynarmic_dir);
     let cmake_profile = build.get_profile().to_owned();
-    build.define("DYNARMIC_FRONTENDS", "A32"); // We don't need 64-bit
+    // A64 is needed for the experimental 64-bit (arm64) guest support.
+    build.define("DYNARMIC_FRONTENDS", "A32;A64");
     build.define("DYNARMIC_WARNINGS_AS_ERRORS", "OFF");
     build.define("DYNARMIC_TESTS", "OFF");
     build.define("DYNARMIC_USE_BUNDLED_EXTERNALS", "ON");
@@ -154,6 +155,7 @@ fn main() {
     let mut wrapper_build = cc::Build::new();
     wrapper_build
         .file(package_root.join("lib.cpp"))
+        .file(package_root.join("lib64.cpp"))
         .cpp(true)
         .std("c++17")
         .include(dynarmic_out.join("include"));
@@ -162,4 +164,5 @@ fn main() {
     }
     wrapper_build.compile("dynarmic_wrapper");
     rerun_if_changed(&package_root.join("lib.cpp"));
+    rerun_if_changed(&package_root.join("lib64.cpp"));
 }
