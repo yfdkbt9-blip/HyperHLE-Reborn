@@ -19,7 +19,7 @@
 #![allow(dead_code)]
 
 use crate::bundle::Bundle;
-use crate::cpu64::{Cpu64, GuestBus, StopReason};
+use crate::cpu64::{Context64, Cpu64, GuestBus, StopReason};
 use crate::mach_o64::{GuestMemory64, MachO64};
 use std::collections::{HashMap, HashSet, VecDeque};
 
@@ -147,6 +147,21 @@ enum Kind {
     MachAbsTime,
     MachTimebase,
     UiApplicationMain,
+    Strncpy,
+    Strcpy,
+    Strcat,
+    Strchr,
+    Strrchr,
+    Bzero,
+    Time,
+    DispatchOnce,
+    DispatchOnceF,
+    PthreadOnce,
+    AllocException,
+    CxaThrow,
+    PthreadKeyCreate,
+    PthreadGetSpecific,
+    PthreadSetSpecific,
     /// Not implemented: logs the first call and returns 0.
     Unknown,
 }
@@ -166,7 +181,28 @@ fn classify(name: &str) -> Kind {
         "_strncmp" => Kind::Strncmp,
         "___stack_chk_fail" => Kind::StackChkFail,
         "_abort" | "_exit" | "__exit" => Kind::Abort,
-        "___cxa_atexit" | "_atexit" => Kind::ReturnZero,
+        "___cxa_atexit" | "_atexit" | "_dlsym" | "_pthread_mutex_init" | "_pthread_mutex_lock"
+        | "_pthread_mutex_unlock" | "_pthread_mutex_destroy" | "_pthread_mutex_trylock"
+        | "_pthread_mutexattr_init" | "_pthread_mutexattr_settype"
+        | "_pthread_mutexattr_destroy" | "_pthread_cond_init" | "_pthread_cond_destroy"
+        | "_pthread_cond_signal" | "_pthread_cond_broadcast" | "_OSSpinLockLock"
+        | "_OSSpinLockUnlock" | "_pthread_rwlock_init" | "_pthread_rwlock_rdlock"
+        | "_pthread_rwlock_wrlock" | "_pthread_rwlock_unlock" => Kind::ReturnZero,
+        "_strncpy" | "___strncpy_chk" => Kind::Strncpy,
+        "_strcpy" | "___strcpy_chk" => Kind::Strcpy,
+        "_strcat" | "___strcat_chk" => Kind::Strcat,
+        "_strchr" => Kind::Strchr,
+        "_strrchr" => Kind::Strrchr,
+        "_bzero" => Kind::Bzero,
+        "_time" => Kind::Time,
+        "_dispatch_once" => Kind::DispatchOnce,
+        "_dispatch_once_f" => Kind::DispatchOnceF,
+        "_pthread_once" => Kind::PthreadOnce,
+        "___cxa_allocate_exception" => Kind::AllocException,
+        "___cxa_throw" => Kind::CxaThrow,
+        "_pthread_key_create" => Kind::PthreadKeyCreate,
+        "_pthread_getspecific" => Kind::PthreadGetSpecific,
+        "_pthread_setspecific" => Kind::PthreadSetSpecific,
         "_mach_absolute_time" => Kind::MachAbsTime,
         "_mach_timebase_info" => Kind::MachTimebase,
         "_UIApplicationMain" => Kind::UiApplicationMain,
@@ -176,8 +212,11 @@ fn classify(name: &str) -> Kind {
 
 enum Flow {
     Continue,
-    /// Stop the whole run, with a human-readable reason.
+    /// Stop the current call into the guest, with a human-readable reason.
     Done(String),
+    /// Run guest function `pc(args)` to completion (e.g. the block given to
+    /// `dispatch_once`), then continue the interrupted call with X0 = `result`.
+    CallGuest { pc: u64, args: Vec<u64>, result: u64 },
 }
 
 /// All "high-level emulation" state: the imported functions and their
@@ -192,6 +231,9 @@ struct Hle {
     calls: u64,
     recent: VecDeque<String>,
     clock: u64,
+    once_done: HashSet<u64>,
+    tsd: HashMap<u64, u64>,
+    next_key: u64,
 }
 
 impl Hle {
@@ -331,6 +373,116 @@ impl Hle {
                         .into(),
                 )
             }
+            Kind::Strncpy => {
+                let n = x2 as usize;
+                if n > 0x400_0000 {
+                    return Flow::Done(format!("strncpy of {n:#x} bytes is implausible"));
+                }
+                let Some(src) = mem.read_c_bytes(x1, n) else {
+                    return Flow::Done(format!("strncpy source {x1:#x} is unmapped"));
+                };
+                let mut buf = src;
+                buf.resize(n, 0);
+                if !mem.write_slice(x0, &buf) {
+                    return Flow::Done(format!("strncpy destination {x0:#x} is unmapped"));
+                }
+                cpu.set_reg(0, x0);
+            }
+            Kind::Strcpy | Kind::Strcat => {
+                let Some(mut src) = mem.read_c_bytes(x1, 1 << 24) else {
+                    return Flow::Done(format!("strcpy source {x1:#x} is unmapped"));
+                };
+                src.push(0);
+                let dst = if kind == Kind::Strcat {
+                    match mem.read_c_bytes(x0, 1 << 24) {
+                        Some(d) => x0 + d.len() as u64,
+                        None => return Flow::Done(format!("strcat destination {x0:#x} is unmapped")),
+                    }
+                } else {
+                    x0
+                };
+                if !mem.write_slice(dst, &src) {
+                    return Flow::Done(format!("strcpy destination {dst:#x} is unmapped"));
+                }
+                cpu.set_reg(0, x0);
+            }
+            Kind::Strchr | Kind::Strrchr => {
+                let Some(s) = mem.read_c_bytes(x0, 1 << 24) else {
+                    return Flow::Done(format!("strchr string {x0:#x} is unmapped"));
+                };
+                let c = x1 as u8;
+                let found = if c == 0 {
+                    Some(s.len())
+                } else if kind == Kind::Strchr {
+                    s.iter().position(|&b| b == c)
+                } else {
+                    s.iter().rposition(|&b| b == c)
+                };
+                cpu.set_reg(0, found.map_or(0, |i| x0 + i as u64));
+            }
+            Kind::Bzero => {
+                let n = x1 as usize;
+                if n > 0x400_0000 || !mem.write_slice(x0, &vec![0u8; n]) {
+                    return Flow::Done(format!("bzero({x0:#x}, {n:#x}) touched unmapped memory"));
+                }
+            }
+            Kind::Time => {
+                let secs = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
+                if x0 != 0 {
+                    mem.write_u64(x0, secs);
+                }
+                cpu.set_reg(0, secs);
+            }
+            Kind::DispatchOnce => {
+                if mem.read_u64(x0) == Some(0) {
+                    mem.write_u64(x0, u64::MAX); // DISPATCH_ONCE_DONE
+                    // Block layout: isa, flags+reserved, invoke, descriptor.
+                    match mem.read_u64(x1.wrapping_add(16)) {
+                        Some(invoke) if invoke != 0 => {
+                            return Flow::CallGuest { pc: invoke, args: vec![x1], result: 0 }
+                        }
+                        _ => return Flow::Done(format!("dispatch_once: bad block {x1:#x}")),
+                    }
+                }
+            }
+            Kind::DispatchOnceF => {
+                if mem.read_u64(x0) == Some(0) {
+                    mem.write_u64(x0, u64::MAX);
+                    return Flow::CallGuest { pc: x2, args: vec![x1], result: 0 };
+                }
+            }
+            Kind::PthreadOnce => {
+                if self.once_done.insert(x0) {
+                    return Flow::CallGuest { pc: x1, args: vec![], result: 0 };
+                }
+                cpu.set_reg(0, 0);
+            }
+            Kind::AllocException => {
+                let p = self.alloc(x0.max(16));
+                cpu.set_reg(0, p);
+            }
+            Kind::CxaThrow => {
+                return Flow::Done(format!(
+                    "the app threw a C++ exception (type_info {x1:#x}) from {lr:#x}"
+                ))
+            }
+            Kind::PthreadKeyCreate => {
+                let key = self.next_key;
+                self.next_key += 1;
+                mem.write_u64(x0, key);
+                cpu.set_reg(0, 0);
+            }
+            Kind::PthreadGetSpecific => {
+                let v = self.tsd.get(&x0).copied().unwrap_or(0);
+                cpu.set_reg(0, v);
+            }
+            Kind::PthreadSetSpecific => {
+                self.tsd.insert(x0, x1);
+                cpu.set_reg(0, 0);
+            }
             Kind::Unknown => {
                 if self.seen.insert(id) {
                     log!("[a64] first call to unimplemented {name} (from {lr:#x}); returning 0");
@@ -362,14 +514,21 @@ struct Machine {
 }
 
 impl Machine {
-    /// Call guest function `pc` and run until it returns to the trap.
+    /// Call guest function `pc` from the top level and run until it returns.
     fn call(&mut self, pc: u64, args: &[u64], what: &str) -> CallEnd {
+        self.run_guest(pc, args, STACK_TOP - 0x800, what)
+    }
+
+    /// Run guest function `pc` on a stack starting at `sp` until it returns to
+    /// the trap. Calls back into the guest from imported functions (like
+    /// `dispatch_once`) nest by recursion.
+    fn run_guest(&mut self, pc: u64, args: &[u64], sp: u64, what: &str) -> CallEnd {
         for (i, a) in args.iter().enumerate() {
             self.cpu.set_reg(i, *a);
         }
         self.cpu.set_pc(pc);
         self.cpu.set_lr(self.trap_addr);
-        self.cpu.set_sp(STACK_TOP - 0x800);
+        self.cpu.set_sp(sp);
         let mut slices = 0;
         loop {
             let mut ticks = TICKS_PER_SLICE;
@@ -378,8 +537,24 @@ impl Machine {
                     return CallEnd::Returned(self.cpu.reg(0));
                 }
                 StopReason::Svc(n) => {
-                    if let Flow::Done(msg) = self.hle.handle(&mut self.cpu, &mut self.mem, n) {
-                        return CallEnd::Stopped(msg);
+                    match self.hle.handle(&mut self.cpu, &mut self.mem, n) {
+                        Flow::Continue => {}
+                        Flow::Done(msg) => return CallEnd::Stopped(msg),
+                        Flow::CallGuest { pc: f, args: a, result } => {
+                            // Park the interrupted call's registers, run the
+                            // callee on the stack below it, then restore.
+                            let mut saved = Context64::default();
+                            self.cpu.swap_context(&mut saved);
+                            self.cpu.set_tpidrro_el0(saved.tpidrro_el0);
+                            self.cpu.set_tpidr_el0(saved.tpidr_el0);
+                            let nested_sp = saved.sp.saturating_sub(0x400) & !0xf;
+                            let end = self.run_guest(f, &a, nested_sp, what);
+                            self.cpu.swap_context(&mut saved);
+                            if let CallEnd::Stopped(msg) = end {
+                                return CallEnd::Stopped(msg);
+                            }
+                            self.cpu.set_reg(0, result);
+                        }
                     }
                     if self.hle.calls > MAX_HLE_CALLS {
                         return CallEnd::Stopped(format!(
@@ -461,6 +636,16 @@ impl Machine {
         log!("[a64] last imported-function calls (oldest first):");
         for c in &self.hle.recent {
             log!("[a64]   {c}");
+        }
+    }
+
+    /// Short version of `dump_state`, for failures we then carry on from.
+    fn brief_state(&self) {
+        log!("[a64]   pc = {}", self.describe(self.cpu.pc()));
+        log!("[a64]   lr = {}", self.describe(self.cpu.lr()));
+        let skip = self.hle.recent.len().saturating_sub(12);
+        for c in self.hle.recent.iter().skip(skip) {
+            log!("[a64]   recent: {c}");
         }
     }
 
@@ -566,6 +751,9 @@ pub fn run(bundle: &Bundle, exe: &[u8]) -> Result<(), String> {
             calls: 0,
             recent: VecDeque::new(),
             clock: 0,
+            once_done: HashSet::new(),
+            tsd: HashMap::new(),
+            next_key: 1,
         },
         trap_addr,
         text_base: macho.text_base,
@@ -596,25 +784,26 @@ pub fn run(bundle: &Bundle, exe: &[u8]) -> Result<(), String> {
     let args = [1, argv, envp, apple];
 
     // Static initializers, then main().
-    let mut failure: Option<String> = None;
+    // A failing initializer is logged and skipped, so one problem doesn't hide
+    // everything after it.
+    let mut failed_inits = 0;
     for (i, &init) in macho.init_funcs.iter().enumerate() {
-        match m.call(init, &args, &format!("initializer #{i}")) {
-            CallEnd::Returned(_) => {}
-            CallEnd::Stopped(msg) => {
-                failure = Some(msg);
-                break;
-            }
+        if let CallEnd::Stopped(msg) = m.call(init, &args, &format!("initializer #{i}")) {
+            failed_inits += 1;
+            echo!("[a64] initializer #{i} ({}) FAILED: {msg}", m.describe(init));
+            m.brief_state();
         }
     }
-    if failure.is_none() {
-        echo!("[a64] all {} initializers returned; calling main", macho.init_funcs.len());
-        match m.call(main_pc, &args, "main") {
-            CallEnd::Returned(code) => {
-                failure = Some(format!("main returned {code} without reaching UIApplicationMain"))
-            }
-            CallEnd::Stopped(msg) => failure = Some(msg),
+    echo!(
+        "[a64] initializers done: {} ran, {failed_inits} failed; calling main",
+        macho.init_funcs.len() - failed_inits
+    );
+    let failure = match m.call(main_pc, &args, "main") {
+        CallEnd::Returned(code) => {
+            Some(format!("main returned {code} without reaching UIApplicationMain"))
         }
-    }
+        CallEnd::Stopped(msg) => Some(msg),
+    };
     let why = failure.unwrap_or_default();
     if why.starts_with("SUCCESS") {
         echo!("[a64] {why}");
