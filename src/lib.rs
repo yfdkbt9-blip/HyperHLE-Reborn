@@ -35,6 +35,7 @@ mod android_web_view;
 mod audio;
 mod bundle;
 mod cpu;
+mod cpu64
 mod crash_handler;
 mod debug;
 mod dyld;
