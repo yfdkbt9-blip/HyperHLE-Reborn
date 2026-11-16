@@ -46,7 +46,10 @@ fn main() {
 
     let mut build = cmake::Config::new(&dynarmic_dir);
     let cmake_profile = build.get_profile().to_owned();
-    build.define("DYNARMIC_FRONTENDS", "A32"); // We don't need 64-bit
+    // Build both guest CPU frontends. The existing runtime still instantiates
+    // A32::Jit; enabling A64 here only makes Dynarmic's A64 API available for
+    // the separate 64-bit backend being developed alongside it.
+    build.define("DYNARMIC_FRONTENDS", "A32;A64");
     build.define("DYNARMIC_WARNINGS_AS_ERRORS", "OFF");
     build.define("DYNARMIC_TESTS", "OFF");
     build.define("DYNARMIC_USE_BUNDLED_EXTERNALS", "ON");
@@ -154,6 +157,7 @@ fn main() {
     let mut wrapper_build = cc::Build::new();
     wrapper_build
         .file(package_root.join("lib.cpp"))
+        .file(package_root.join("arm64.cpp"))
         .cpp(true)
         .std("c++17")
         .include(dynarmic_out.join("include"));
@@ -162,4 +166,5 @@ fn main() {
     }
     wrapper_build.compile("dynarmic_wrapper");
     rerun_if_changed(&package_root.join("lib.cpp"));
+    rerun_if_changed(&package_root.join("arm64.cpp"));
 }

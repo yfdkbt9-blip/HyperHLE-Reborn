@@ -1,0 +1,57 @@
+name: Experimental ARM64 runtime build
+
+on:
+  push:
+    branches:
+      - experimental/arm64-a64-support
+  pull_request:
+    branches:
+      - trunk
+
+  workflow_dispatch:
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  macos-arm64:
+    runs-on: macos-15
+    steps:
+      - name: Checkout repository and submodules
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install Rust target
+        run: rustup target add aarch64-apple-darwin
+
+      - name: Setup CMake
+        uses: lukka/get-cmake@v3
+        with:
+          cmakeVersion: "~3.29.0"
+
+      - name: Cache Boost
+        id: boost-cache
+        uses: actions/cache@v4
+        with:
+          path: vendor/boost
+          key: boost-1.81.0-macos-arm64
+
+      - name: Download Boost
+        if: steps.boost-cache.outputs.cache-hit != 'true'
+        run: |
+          curl -L -o boost.tar.gz https://archives.boost.io/release/1.81.0/source/boost_1_81_0.tar.gz
+          mkdir -p vendor
+          tar xzf boost.tar.gz -C vendor
+          mv vendor/boost_1_81_0 vendor/boost
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Run ARM64 unit tests
+        run: cargo test --target aarch64-apple-darwin
+
+      - name: Build ARM64 host target
+        run: cargo build --target aarch64-apple-darwin --release
+
+      - name: Compile the standalone ARM64 entry-point probe
+        run: cargo check --target aarch64-apple-darwin --features arm64-probe --bin arm64-probe
