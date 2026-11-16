@@ -36,6 +36,7 @@ mod audio;
 mod bundle;
 mod cpu;
 mod cpu64;
+mod a64_probe;
 mod crash_handler;
 mod debug;
 mod dyld;
@@ -437,7 +438,14 @@ fn run_session<T: Iterator<Item = String>>(
             return Err(format!("Application bundle error: {err}. Check that the path is to an .app directory or an .ipa file."));
         }
     };
-
+    // Experimental: 64-bit (arm64) apps can't run on the 32-bit engine,
+    // so they go to the 64-bit probe instead.
+    if let Ok(exe) = fs.read(bundle.executable_path()) {
+        if mach_o64::is_arm64_only(&exe) {
+            a64_probe::run(&bundle, &exe)?;
+            return Ok(None);
+        }
+    }
     let app_id = bundle.bundle_identifier();
 
     // Gangstar Rio is landscape-only. Keep UIScreen's point and pixel axes
