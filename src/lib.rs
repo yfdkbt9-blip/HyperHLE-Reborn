@@ -442,7 +442,7 @@ fn run_session<T: Iterator<Item = String>>(
     // so they go to the 64-bit probe instead.
     if let Ok(exe) = fs.read(bundle.executable_path()) {
         if mach_o64::is_arm64_only(&exe) {
-            a64_probe::run(&bundle, &exe)?;
+           a64_probe::run(&bundle, &fs, &exe)?;
             return Ok(None);
         }
     }
