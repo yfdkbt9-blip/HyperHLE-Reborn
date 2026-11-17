@@ -38,7 +38,7 @@ const TRAP_SVC: u32 = 0xffff;
 /// into the guest may use before we decide it is stuck in a loop.
 const TICKS_PER_SLICE: u64 = 50_000_000;
 const MAX_SLICES: u32 = 40;
-const MAX_HLE_CALLS: u64 = 30_000_000;
+const MAX_HLE_CALLS: u64 = 2_000_000;
 
 // ---------------------------------------------------------------------------
 // Memory
@@ -171,6 +171,25 @@ enum Kind {
     NsStringFromClass,
     SelRegister,
     ObjectGetClass,
+    ClassGetInstanceMethod,
+    ClassGetClassMethod,
+    MethodGetImplementation,
+    MethodGetTypeEncoding,
+    MethodSetImplementation,
+    MethodExchange,
+    ClassAddMethod,
+    ClassReplaceMethod,
+    ObjcGetProperty,
+    ObjcSetProperty,
+    GuardAcquire,
+    GuardRelease,
+    DyldImageCount,
+    DyldImageName,
+    NsSearchPath,
+    NsLog,
+    NewHandle,
+    ReturnOne,
+    BlockObjectAssign,
     /// Not implemented: logs the first call and returns 0.
     Unknown,
 }
@@ -215,6 +234,38 @@ fn classify(name: &str) -> Kind {
         "_mach_absolute_time" => Kind::MachAbsTime,
         "_mach_timebase_info" => Kind::MachTimebase,
         "_UIApplicationMain" => Kind::UiApplicationMain,
+        "_class_getInstanceMethod" => Kind::ClassGetInstanceMethod,
+        "_class_getClassMethod" => Kind::ClassGetClassMethod,
+        "_method_getImplementation" => Kind::MethodGetImplementation,
+        "_method_getTypeEncoding" => Kind::MethodGetTypeEncoding,
+        "_method_setImplementation" => Kind::MethodSetImplementation,
+        "_method_exchangeImplementations" => Kind::MethodExchange,
+        "_class_addMethod" => Kind::ClassAddMethod,
+        "_class_replaceMethod" => Kind::ClassReplaceMethod,
+        "_objc_getProperty" => Kind::ObjcGetProperty,
+        "_objc_setProperty_atomic"
+        | "_objc_setProperty_nonatomic"
+        | "_objc_setProperty_atomic_copy"
+        | "_objc_setProperty_nonatomic_copy"
+        | "_objc_setProperty" => Kind::ObjcSetProperty,
+        "___cxa_guard_acquire" => Kind::GuardAcquire,
+        "___cxa_guard_release" => Kind::GuardRelease,
+        "__dyld_image_count" => Kind::DyldImageCount,
+        "__dyld_get_image_name" => Kind::DyldImageName,
+        "_NSSearchPathForDirectoriesInDomains" => Kind::NsSearchPath,
+        "_NSLog" => Kind::NsLog,
+        "_SCNetworkReachabilityCreateWithAddress"
+        | "_SCNetworkReachabilityCreateWithName"
+        | "_CFRunLoopGetCurrent"
+        | "_CFRunLoopGetMain" => Kind::NewHandle,
+        "_SCNetworkReachabilitySetCallback"
+        | "_SCNetworkReachabilityScheduleWithRunLoop"
+        | "_SCNetworkReachabilityUnscheduleFromRunLoop"
+        | "_SCNetworkReachabilitySetDispatchQueue" => Kind::ReturnOne,
+        "__Block_object_assign" => Kind::BlockObjectAssign,
+        "_Block_copy" | "_CFRetain" => Kind::ReturnX0,
+        "_Block_release" | "_CFRelease" => Kind::Free,
+        "_objc_sync_enter" | "_objc_sync_exit" | "___cxa_guard_abort" | "__Block_object_dispose" => Kind::ReturnZero,
         "_objc_msgSend" => Kind::ObjcMsgSend,
         "_objc_msgSendSuper2" => Kind::ObjcMsgSendSuper2,
         "_objc_retain"
@@ -413,6 +464,9 @@ struct Objc {
     /// (principal class name, delegate class name) strings given to
     /// UIApplicationMain.
     app_main: Option<(u64, u64)>,
+    /// (owning class, selector) -> `Method` handle, and back.
+    method_handles: HashMap<(u64, String), u64>,
+    handle_info: HashMap<u64, (u64, String)>,
 }
 
 impl Objc {
@@ -583,6 +637,51 @@ impl Objc {
         }
     }
 
+    /// The class that implements `sel` for `start` and the implementation.
+    fn find_owner(&self, start: u64, sel: &str) -> Option<(u64, u64)> {
+        let mut c = start;
+        for _ in 0..64 {
+            let info = self.classes.get(&c)?;
+            if let Some(&imp) = info.methods.get(sel) {
+                return Some((c, imp));
+            }
+            if info.superclass == 0 || info.superclass == c {
+                return None;
+            }
+            c = info.superclass;
+        }
+        None
+    }
+
+    /// A `Method` handle (as returned by `class_getInstanceMethod`): a small
+    /// guest struct { selector, type encoding, implementation }.
+    fn method_handle(&mut self, mem: &mut Mem64, heap: &mut Heap, owner: u64, sel: &str) -> u64 {
+        let key = (owner, sel.to_string());
+        if let Some(&h) = self.method_handles.get(&key) {
+            return h;
+        }
+        let imp = self.classes.get(&owner).and_then(|c| c.methods.get(sel)).copied().unwrap_or(0);
+        let h = heap.alloc(24);
+        mem.write_u64(h, self.sels.get(sel).copied().unwrap_or(0));
+        mem.write_u64(h + 8, 0);
+        mem.write_u64(h + 16, imp);
+        self.method_handles.insert(key.clone(), h);
+        self.handle_info.insert(h, key);
+        h
+    }
+
+    /// Set the implementation of the method behind handle `h`; returns the old one.
+    fn set_method_imp(&mut self, mem: &mut Mem64, h: u64, imp: u64) -> u64 {
+        let Some((owner, sel)) = self.handle_info.get(&h).cloned() else { return 0 };
+        let old = self
+            .classes
+            .get_mut(&owner)
+            .and_then(|c| c.methods.insert(sel, imp))
+            .unwrap_or(0);
+        mem.write_u64(h + 16, imp);
+        old
+    }
+
     /// The class of an object (for a class object: its metaclass).
     fn class_of(&self, mem: &Mem64, obj: u64) -> Option<u64> {
         let isa = mem.read_u64(obj)?;
@@ -643,6 +742,77 @@ impl Objc {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Foundation objects
+//
+// Objects of Foundation classes (NSString, NSNumber, NSArray, ...) are made
+// of a small block of guest memory holding the `isa` pointer, plus a Rust
+// value in `Hle::objs`, keyed by the object's address.
+
+#[derive(Clone, Copy, Debug)]
+struct Num {
+    i: i64,
+    f: f64,
+    float: bool,
+    boolean: bool,
+}
+
+impl Num {
+    fn int(i: i64) -> Num {
+        Num { i, f: 0.0, float: false, boolean: false }
+    }
+    fn dbl(f: f64) -> Num {
+        Num { i: 0, f, float: true, boolean: false }
+    }
+    fn from_bool(b: bool) -> Num {
+        Num { i: b as i64, f: 0.0, float: false, boolean: true }
+    }
+    fn as_i64(&self) -> i64 {
+        if self.float {
+            self.f as i64
+        } else {
+            self.i
+        }
+    }
+    fn as_f64(&self) -> f64 {
+        if self.float {
+            self.f
+        } else {
+            self.i as f64
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+enum Obj {
+    Str(String),
+    Num(Num),
+    Array(Vec<u64>),
+    /// Key/value pairs in insertion order.
+    Dict(Vec<(u64, u64)>),
+    Url(String),
+    /// An object of a system class that carries no data (a singleton, a pool).
+    Plain,
+}
+
+/// Screen size we pretend to have, in points (an iPhone 6s in landscape).
+const SCREEN_W: f64 = 667.0;
+const SCREEN_H: f64 = 375.0;
+const SCREEN_SCALE: f64 = 2.0;
+/// `NSNotFound`.
+const NS_NOT_FOUND: u64 = i64::MAX as u64;
+/// Pretend location of the app's sandbox.
+const SANDBOX: &str = "/var/mobile/Containers/Data/Application/00000000-0000-0000-0000-000000000000";
+
+fn fnv_hash(s: &str) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in s.bytes() {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    h
+}
+
 /// All "high-level emulation" state: the imported functions and their
 /// bookkeeping.
 struct Hle {
@@ -650,6 +820,18 @@ struct Hle {
     kinds: Vec<Kind>,
     heap: Heap,
     objc: Objc,
+    /// Rust-side state of Foundation objects, by object address.
+    objs: HashMap<u64, Obj>,
+    singletons: HashMap<String, u64>,
+    cstr_cache: HashMap<u64, u64>,
+    /// Threads the app asked for: (target, selector, argument).
+    pending_threads: Vec<(u64, u64, u64)>,
+    thread_inits: HashMap<u64, (u64, u64, u64)>,
+    bundle_path: String,
+    bundle_id: String,
+    exe_name: String,
+    exe_path_ptr: u64,
+    seen_logs: HashSet<String>,
     seen: HashSet<u32>,
     counts: HashMap<u32, u64>,
     calls: u64,
@@ -670,21 +852,13 @@ impl Hle {
         let size = self.objc.classes.get(&cls).map_or(0x40, |c| c.instance_size).max(16);
         let p = self.heap.alloc(size);
         mem.write_u64(p, cls);
+        self.init_storage(p, cls);
         p
     }
 
     /// A constant-string object (like an `@"..."` literal) holding `text`.
     fn make_string(&mut self, mem: &mut Mem64, text: &str) -> u64 {
-        let (cls, _) = self.objc.system_class(mem, &mut self.heap, "NSConstantString");
-        let bytes = text.as_bytes();
-        let chars = self.heap.alloc(bytes.len() as u64 + 1);
-        mem.write_slice(chars, bytes);
-        let obj = self.heap.alloc(32);
-        mem.write_u64(obj, cls);
-        mem.write_u64(obj + 8, 0x7c8);
-        mem.write_u64(obj + 16, chars);
-        mem.write_u64(obj + 24, bytes.len() as u64);
-        obj
+        self.new_string(mem, text)
     }
 
     /// `objc_msgSend`: find the method and jump to it (app code), or run a
@@ -732,6 +906,9 @@ impl Hle {
         if let Some(imp) = self.objc.find(start.unwrap_or(cls), &sel) {
             // Tail call: the method returns straight to our caller.
             cpu.set_pc(imp);
+            return Flow::Continue;
+        }
+        if self.hle_message(cpu, mem, recv, cls, &sel, lr) {
             return Flow::Continue;
         }
         if let Some(flow) = self.nsobject_builtin(cpu, mem, recv, cls, &sel, stub_addr, lr) {
@@ -830,6 +1007,1258 @@ impl Hle {
             _ => return None,
         }
         Some(Flow::Continue)
+    }
+
+    // ----- Foundation object helpers -----
+
+    fn new_obj(&mut self, mem: &mut Mem64, class: &str, o: Obj) -> u64 {
+        let (cls, _) = self.objc.system_class(mem, &mut self.heap, class);
+        let p = self.heap.alloc(0x40);
+        mem.write_u64(p, cls);
+        self.objs.insert(p, o);
+        p
+    }
+
+    fn new_string(&mut self, mem: &mut Mem64, s: &str) -> u64 {
+        self.new_obj(mem, "NSString", Obj::Str(s.to_string()))
+    }
+
+    fn class_name(&self, c: u64) -> String {
+        self.objc.classes.get(&c).map(|i| i.name.clone()).unwrap_or_else(|| "?".to_string())
+    }
+
+    /// Text of an NSString (or NSURL path), whether made by us or an `@"..."`
+    /// literal from the app.
+    fn str_of(&self, mem: &Mem64, obj: u64) -> Option<String> {
+        match self.objs.get(&obj) {
+            Some(Obj::Str(s)) | Some(Obj::Url(s)) => return Some(s.clone()),
+            Some(_) => return None,
+            None => {}
+        }
+        let cls = self.objc.class_of(mem, obj)?;
+        if self.objc.classes.get(&cls)?.name == "NSConstantString" {
+            read_cfstring(mem, obj)
+        } else {
+            None
+        }
+    }
+
+    fn num_of(&self, obj: u64) -> Option<Num> {
+        match self.objs.get(&obj) {
+            Some(Obj::Num(n)) => Some(*n),
+            _ => None,
+        }
+    }
+
+    fn alloc_cstr(&mut self, mem: &mut Mem64, s: &str) -> u64 {
+        let mut b = s.as_bytes().to_vec();
+        b.push(0);
+        let p = self.heap.alloc(b.len() as u64);
+        mem.write_slice(p, &b);
+        p
+    }
+
+    /// A C string with the text of `obj`, kept alive for the whole run.
+    fn utf8_ptr(&mut self, mem: &mut Mem64, obj: u64) -> u64 {
+        if let Some(p) = self.cstr_cache.get(&obj) {
+            return *p;
+        }
+        let s = self.str_of(mem, obj).unwrap_or_default();
+        let p = self.alloc_cstr(mem, &s);
+        self.cstr_cache.insert(obj, p);
+        p
+    }
+
+    /// What `%@` / `-description` prints for an object.
+    fn description(&self, mem: &Mem64, obj: u64) -> String {
+        if obj == 0 {
+            return "(null)".to_string();
+        }
+        match self.objs.get(&obj) {
+            Some(Obj::Str(s)) | Some(Obj::Url(s)) => return s.clone(),
+            Some(Obj::Num(n)) => {
+                return if n.float { format!("{}", n.f) } else { n.i.to_string() };
+            }
+            Some(Obj::Array(v)) => {
+                let parts: Vec<String> = v.iter().map(|o| self.description(mem, *o)).collect();
+                return format!("({})", parts.join(", "));
+            }
+            Some(Obj::Dict(d)) => {
+                let parts: Vec<String> = d
+                    .iter()
+                    .map(|(k, v)| format!("{} = {};", self.description(mem, *k), self.description(mem, *v)))
+                    .collect();
+                return format!("{{{}}}", parts.join(" "));
+            }
+            _ => {}
+        }
+        if let Some(s) = self.str_of(mem, obj) {
+            return s;
+        }
+        if let Some(info) = self.objc.classes.get(&obj) {
+            return info.name.clone();
+        }
+        let cname = self
+            .objc
+            .class_of(mem, obj)
+            .map(|c| self.class_name(c))
+            .unwrap_or_else(|| "?".to_string());
+        format!("<{cname}: {obj:#x}>")
+    }
+
+    fn obj_eq(&self, mem: &Mem64, a: u64, b: u64) -> bool {
+        if a == b {
+            return true;
+        }
+        if let (Some(x), Some(y)) = (self.num_of(a), self.num_of(b)) {
+            return if x.float || y.float { x.as_f64() == y.as_f64() } else { x.i == y.i };
+        }
+        match (self.str_of(mem, a), self.str_of(mem, b)) {
+            (Some(x), Some(y)) => x == y,
+            _ => false,
+        }
+    }
+
+    fn dict_find(&self, mem: &Mem64, d: u64, key: u64) -> Option<usize> {
+        match self.objs.get(&d) {
+            Some(Obj::Dict(v)) => v.iter().position(|(k, _)| self.obj_eq(mem, *k, key)),
+            _ => None,
+        }
+    }
+
+    fn dict_get(&self, mem: &Mem64, d: u64, key: u64) -> u64 {
+        match (self.dict_find(mem, d, key), self.objs.get(&d)) {
+            (Some(i), Some(Obj::Dict(v))) => v[i].1,
+            _ => 0,
+        }
+    }
+
+    fn dict_set(&mut self, mem: &Mem64, d: u64, key: u64, val: u64) {
+        let idx = self.dict_find(mem, d, key);
+        if let Some(Obj::Dict(v)) = self.objs.get_mut(&d) {
+            match idx {
+                Some(i) => v[i].1 = val,
+                None => v.push((key, val)),
+            }
+        }
+    }
+
+    /// One shared object per `key` (like `+[NSUserDefaults standardUserDefaults]`).
+    fn singleton(&mut self, mem: &mut Mem64, key: &str, class: &str, o: Obj) -> u64 {
+        if let Some(p) = self.singletons.get(key) {
+            return *p;
+        }
+        let p = self.new_obj(mem, class, o);
+        self.singletons.insert(key.to_string(), p);
+        p
+    }
+
+    fn log_once(&mut self, text: String) {
+        if self.seen_logs.insert(text.clone()) {
+            log!("[a64] {text}");
+        }
+    }
+
+    /// Give a freshly allocated instance of a Foundation class its storage.
+    fn init_storage(&mut self, obj: u64, cls: u64) {
+        let mut c = cls;
+        for _ in 0..16 {
+            let Some(info) = self.objc.classes.get(&c) else { break };
+            let o = match info.name.as_str() {
+                "NSString" => Some(Obj::Str(String::new())),
+                "NSArray" => Some(Obj::Array(Vec::new())),
+                "NSDictionary" => Some(Obj::Dict(Vec::new())),
+                "NSNumber" => Some(Obj::Num(Num::int(0))),
+                "NSURL" => Some(Obj::Url(String::new())),
+                _ => None,
+            };
+            if let Some(o) = o {
+                self.objs.insert(obj, o);
+                return;
+            }
+            if info.superclass == 0 || info.superclass == c {
+                break;
+            }
+            c = info.superclass;
+        }
+    }
+
+    /// printf-style formatting as `+[NSString stringWithFormat:]` does it.
+    /// Variadic arguments are 8-byte slots on the stack (Apple arm64 ABI).
+    fn ns_format(&self, mem: &Mem64, fmt: &str, sp: u64) -> String {
+        let chars: Vec<char> = fmt.chars().collect();
+        let mut out = String::new();
+        let mut argi: u64 = 0;
+        let mut next = || -> u64 {
+            let v = mem.read_u64(sp.wrapping_add(argi * 8)).unwrap_or(0);
+            argi += 1;
+            v
+        };
+        let mut i = 0usize;
+        while i < chars.len() {
+            let c = chars[i];
+            i += 1;
+            if c != '%' {
+                out.push(c);
+                continue;
+            }
+            let (mut left, mut zero, mut plus, mut space, mut alt) = (false, false, false, false, false);
+            while i < chars.len() && "-0+ #".contains(chars[i]) {
+                match chars[i] {
+                    '-' => left = true,
+                    '0' => zero = true,
+                    '+' => plus = true,
+                    ' ' => space = true,
+                    _ => alt = true,
+                }
+                i += 1;
+            }
+            let mut width = 0usize;
+            if i < chars.len() && chars[i] == '*' {
+                let w = next() as i32;
+                if w < 0 {
+                    left = true;
+                }
+                width = (w.unsigned_abs() as usize).min(1000);
+                i += 1;
+            } else {
+                while i < chars.len() && chars[i].is_ascii_digit() {
+                    width = (width * 10 + chars[i].to_digit(10).unwrap() as usize).min(1000);
+                    i += 1;
+                }
+            }
+            let mut prec: Option<usize> = None;
+            if i < chars.len() && chars[i] == '.' {
+                i += 1;
+                let mut p = 0usize;
+                if i < chars.len() && chars[i] == '*' {
+                    p = (next() as i32).max(0) as usize;
+                    i += 1;
+                } else {
+                    while i < chars.len() && chars[i].is_ascii_digit() {
+                        p = (p * 10 + chars[i].to_digit(10).unwrap() as usize).min(1000);
+                        i += 1;
+                    }
+                }
+                prec = Some(p);
+            }
+            let mut long = 0u32;
+            while i < chars.len() && "hlzjtqL".contains(chars[i]) {
+                if chars[i] != 'h' {
+                    long += 1;
+                }
+                i += 1;
+            }
+            if i >= chars.len() {
+                break;
+            }
+            let conv = chars[i];
+            i += 1;
+            let body: String = match conv {
+                '%' => "%".to_string(),
+                '@' => {
+                    let o = next();
+                    self.description(mem, o)
+                }
+                'd' | 'i' => {
+                    let v = next();
+                    let n: i64 = if long > 0 { v as i64 } else { v as i32 as i64 };
+                    let mut digits = n.unsigned_abs().to_string();
+                    if let Some(p) = prec {
+                        while digits.len() < p {
+                            digits.insert(0, '0');
+                        }
+                    }
+                    let sign = if n < 0 { "-" } else if plus { "+" } else if space { " " } else { "" };
+                    format!("{sign}{digits}")
+                }
+                'u' | 'x' | 'X' | 'o' => {
+                    let v = next();
+                    let n: u64 = if long > 0 { v } else { v as u32 as u64 };
+                    let mut d = match conv {
+                        'u' => n.to_string(),
+                        'x' => format!("{n:x}"),
+                        'X' => format!("{n:X}"),
+                        _ => format!("{n:o}"),
+                    };
+                    if let Some(p) = prec {
+                        while d.len() < p {
+                            d.insert(0, '0');
+                        }
+                    }
+                    if alt && n != 0 {
+                        match conv {
+                            'x' => d = format!("0x{d}"),
+                            'X' => d = format!("0X{d}"),
+                            'o' => d = format!("0{d}"),
+                            _ => {}
+                        }
+                    }
+                    d
+                }
+                'c' => {
+                    let v = next();
+                    char::from_u32(v as u32).map(|c| c.to_string()).unwrap_or_default()
+                }
+                's' => {
+                    let p = next();
+                    let mut s = mem
+                        .read_c_bytes(p, 1 << 16)
+                        .map(|b| String::from_utf8_lossy(&b).into_owned())
+                        .unwrap_or_else(|| "(null)".to_string());
+                    if let Some(pr) = prec {
+                        s = s.chars().take(pr).collect();
+                    }
+                    s
+                }
+                'f' | 'F' | 'e' | 'E' | 'g' | 'G' => {
+                    let f = f64::from_bits(next());
+                    let sign = if f.is_sign_negative() && !f.is_nan() {
+                        "-"
+                    } else if plus {
+                        "+"
+                    } else if space {
+                        " "
+                    } else {
+                        ""
+                    };
+                    let a = f.abs();
+                    let s = match conv {
+                        'f' | 'F' => format!("{:.*}", prec.unwrap_or(6), a),
+                        'e' => format!("{:.*e}", prec.unwrap_or(6), a),
+                        'E' => format!("{:.*E}", prec.unwrap_or(6), a),
+                        _ => format!("{a}"),
+                    };
+                    format!("{sign}{s}")
+                }
+                'p' => {
+                    let v = next();
+                    format!("0x{v:x}")
+                }
+                other => format!("%{other}"),
+            };
+            let numeric = matches!(conv, 'd' | 'i' | 'u' | 'x' | 'X' | 'o' | 'f' | 'F' | 'e' | 'E' | 'g' | 'G');
+            let len = body.chars().count();
+            if len >= width {
+                out.push_str(&body);
+            } else if left {
+                out.push_str(&body);
+                out.push_str(&" ".repeat(width - len));
+            } else if zero && numeric {
+                let (sign, digits) = if body.starts_with(|c: char| c == '-' || c == '+' || c == ' ') {
+                    body.split_at(1)
+                } else {
+                    ("", body.as_str())
+                };
+                out.push_str(sign);
+                out.push_str(&"0".repeat(width - len));
+                out.push_str(digits);
+            } else {
+                out.push_str(&" ".repeat(width - len));
+                out.push_str(&body);
+            }
+        }
+        out
+    }
+
+    /// Foundation / UIKit methods that we implement ourselves, looked up
+    /// along the system part of the class chain. `false` = nobody does.
+    #[allow(clippy::too_many_arguments)]
+    fn hle_message(
+        &mut self,
+        cpu: &mut Cpu64,
+        mem: &mut Mem64,
+        recv: u64,
+        cls: u64,
+        sel: &str,
+        lr: u64,
+    ) -> bool {
+        let mut chain: Vec<(String, bool)> = Vec::new();
+        let mut c = cls;
+        for _ in 0..32 {
+            let Some(info) = self.objc.classes.get(&c) else { break };
+            chain.push((info.name.clone(), info.is_meta));
+            if info.superclass == 0 || info.superclass == c {
+                break;
+            }
+            c = info.superclass;
+        }
+        for (name, class_level) in &chain {
+            if self.hle_call(cpu, mem, recv, name, *class_level, sel, lr) {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// One class's share of `hle_message`. `class_level` = the message goes
+    /// to the class itself (a "+" method).
+    #[allow(clippy::too_many_arguments, unreachable_code)]
+    fn hle_call(
+        &mut self,
+        cpu: &mut Cpu64,
+        mem: &mut Mem64,
+        recv: u64,
+        name: &str,
+        class_level: bool,
+        sel: &str,
+        lr: u64,
+    ) -> bool {
+        let _ = lr;
+        let (a2, a3, a4) = (cpu.reg(2), cpu.reg(3), cpu.reg(4));
+        let sp = cpu.sp();
+        macro_rules! ret {
+            ($v:expr) => {{
+                let v: u64 = $v;
+                cpu.set_reg(0, v);
+                return true;
+            }};
+        }
+        match (name, class_level, sel) {
+            // ----- NSObject -----
+            ("NSObject", false, "description") | ("NSObject", false, "debugDescription") => {
+                let d = self.description(mem, recv);
+                let o = self.new_string(mem, &d);
+                ret!(o)
+            }
+
+            // ----- NSString -----
+            ("NSString", true, "stringWithUTF8String:") | ("NSString", true, "stringWithCString:encoding:") => {
+                let s = Objc::cstr(mem, a2).unwrap_or_default();
+                let o = self.new_string(mem, &s);
+                ret!(o)
+            }
+            ("NSString", true, "stringWithFormat:") => {
+                let fmt = self.str_of(mem, a2).unwrap_or_default();
+                let s = self.ns_format(mem, &fmt, sp);
+                let o = self.new_string(mem, &s);
+                ret!(o)
+            }
+            ("NSString", true, "string") | ("NSString", true, "stringWithCapacity:") => {
+                let o = self.new_string(mem, "");
+                ret!(o)
+            }
+            ("NSString", true, "stringWithString:") => {
+                let s = self.str_of(mem, a2).unwrap_or_default();
+                let o = self.new_string(mem, &s);
+                ret!(o)
+            }
+            ("NSString", false, "initWithString:") => {
+                let s = self.str_of(mem, a2).unwrap_or_default();
+                self.objs.insert(recv, Obj::Str(s));
+                ret!(recv)
+            }
+            ("NSString", false, "initWithUTF8String:") => {
+                let s = Objc::cstr(mem, a2).unwrap_or_default();
+                self.objs.insert(recv, Obj::Str(s));
+                ret!(recv)
+            }
+            ("NSString", false, "initWithFormat:") => {
+                let fmt = self.str_of(mem, a2).unwrap_or_default();
+                let s = self.ns_format(mem, &fmt, sp);
+                self.objs.insert(recv, Obj::Str(s));
+                ret!(recv)
+            }
+            ("NSString", false, "initWithCapacity:") => ret!(recv),
+            ("NSString", false, "UTF8String") | ("NSString", false, "cStringUsingEncoding:") => {
+                let p = self.utf8_ptr(mem, recv);
+                ret!(p)
+            }
+            ("NSString", false, "length") => {
+                let n = self.str_of(mem, recv).map_or(0, |s| s.encode_utf16().count());
+                ret!(n as u64)
+            }
+            ("NSString", false, "isEqualToString:") | ("NSString", false, "isEqual:") => {
+                let eq = match (self.str_of(mem, recv), self.str_of(mem, a2)) {
+                    (Some(x), Some(y)) => x == y,
+                    _ => recv == a2,
+                };
+                ret!(eq as u64)
+            }
+            ("NSString", false, "hash") => {
+                let h = self.str_of(mem, recv).map_or(recv, |s| fnv_hash(&s));
+                ret!(h)
+            }
+            ("NSString", false, "description")
+            | ("NSString", false, "copy")
+            | ("NSString", false, "copyWithZone:")
+            | ("NSString", false, "stringByStandardizingPath") => ret!(recv),
+            ("NSString", false, "mutableCopy") => {
+                let s = self.str_of(mem, recv).unwrap_or_default();
+                let o = self.new_obj(mem, "NSMutableString", Obj::Str(s));
+                ret!(o)
+            }
+            ("NSString", false, "stringByAppendingString:") => {
+                let s = self.str_of(mem, recv).unwrap_or_default() + &self.str_of(mem, a2).unwrap_or_default();
+                let o = self.new_string(mem, &s);
+                ret!(o)
+            }
+            ("NSString", false, "stringByAppendingPathComponent:") => {
+                let base = self.str_of(mem, recv).unwrap_or_default();
+                let part = self.str_of(mem, a2).unwrap_or_default();
+                let s = if base.is_empty() {
+                    part
+                } else if base.ends_with('/') {
+                    format!("{base}{part}")
+                } else {
+                    format!("{base}/{part}")
+                };
+                let o = self.new_string(mem, &s);
+                ret!(o)
+            }
+            ("NSString", false, "lastPathComponent") => {
+                let s = self.str_of(mem, recv).unwrap_or_default();
+                let last = s.trim_end_matches('/').rsplit('/').next().unwrap_or("").to_string();
+                let o = self.new_string(mem, &last);
+                ret!(o)
+            }
+            ("NSString", false, "pathExtension") => {
+                let s = self.str_of(mem, recv).unwrap_or_default();
+                let last = s.trim_end_matches('/').rsplit('/').next().unwrap_or("").to_string();
+                let ext = last.rsplit_once('.').map(|(_, e)| e.to_string()).unwrap_or_default();
+                let o = self.new_string(mem, &ext);
+                ret!(o)
+            }
+            ("NSString", false, "stringByDeletingLastPathComponent") => {
+                let s = self.str_of(mem, recv).unwrap_or_default();
+                let dir = s.trim_end_matches('/').rsplit_once('/').map(|(d, _)| d.to_string()).unwrap_or_default();
+                let o = self.new_string(mem, &dir);
+                ret!(o)
+            }
+            ("NSString", false, "hasPrefix:") => {
+                let (s, p) = (self.str_of(mem, recv), self.str_of(mem, a2));
+                ret!(matches!((s, p), (Some(s), Some(p)) if s.starts_with(&p)) as u64)
+            }
+            ("NSString", false, "hasSuffix:") => {
+                let (s, p) = (self.str_of(mem, recv), self.str_of(mem, a2));
+                ret!(matches!((s, p), (Some(s), Some(p)) if s.ends_with(&p)) as u64)
+            }
+            ("NSString", false, "containsString:") => {
+                let (s, p) = (self.str_of(mem, recv), self.str_of(mem, a2));
+                ret!(matches!((s, p), (Some(s), Some(p)) if s.contains(&p)) as u64)
+            }
+            ("NSString", false, "rangeOfString:") => {
+                let hay = self.str_of(mem, recv).unwrap_or_default();
+                let needle = self.str_of(mem, a2).unwrap_or_default();
+                match hay.find(&needle) {
+                    Some(b) => {
+                        cpu.set_reg(0, hay[..b].encode_utf16().count() as u64);
+                        cpu.set_reg(1, needle.encode_utf16().count() as u64);
+                    }
+                    None => {
+                        cpu.set_reg(0, NS_NOT_FOUND);
+                        cpu.set_reg(1, 0);
+                    }
+                }
+                return true;
+            }
+            ("NSString", false, "substringFromIndex:") => {
+                let s: String = self.str_of(mem, recv).unwrap_or_default().chars().skip(a2 as usize).collect();
+                let o = self.new_string(mem, &s);
+                ret!(o)
+            }
+            ("NSString", false, "substringToIndex:") => {
+                let s: String = self.str_of(mem, recv).unwrap_or_default().chars().take(a2 as usize).collect();
+                let o = self.new_string(mem, &s);
+                ret!(o)
+            }
+            ("NSString", false, "componentsSeparatedByString:") => {
+                let s = self.str_of(mem, recv).unwrap_or_default();
+                let sep = self.str_of(mem, a2).unwrap_or_default();
+                let parts: Vec<String> = if sep.is_empty() {
+                    vec![s]
+                } else {
+                    s.split(sep.as_str()).map(|p| p.to_string()).collect()
+                };
+                let items: Vec<u64> = parts.iter().map(|p| self.new_string(mem, p)).collect();
+                let arr = self.new_obj(mem, "NSArray", Obj::Array(items));
+                ret!(arr)
+            }
+            ("NSString", false, "stringByReplacingOccurrencesOfString:withString:") => {
+                let s = self.str_of(mem, recv).unwrap_or_default();
+                let from = self.str_of(mem, a2).unwrap_or_default();
+                let to = self.str_of(mem, a3).unwrap_or_default();
+                let r = if from.is_empty() { s } else { s.replace(&from, &to) };
+                let o = self.new_string(mem, &r);
+                ret!(o)
+            }
+            ("NSString", false, "lowercaseString") | ("NSString", false, "uppercaseString") => {
+                let s = self.str_of(mem, recv).unwrap_or_default();
+                let r = if sel == "lowercaseString" { s.to_lowercase() } else { s.to_uppercase() };
+                let o = self.new_string(mem, &r);
+                ret!(o)
+            }
+            ("NSString", false, "intValue") | ("NSString", false, "integerValue") | ("NSString", false, "longLongValue") => {
+                let s = self.str_of(mem, recv).unwrap_or_default();
+                let n: i64 = s.trim().split(|c: char| !(c.is_ascii_digit() || c == '-')).next().unwrap_or("").parse().unwrap_or(0);
+                ret!(n as u64)
+            }
+            ("NSString", false, "doubleValue") | ("NSString", false, "floatValue") => {
+                let s = self.str_of(mem, recv).unwrap_or_default();
+                let f: f64 = s.trim().parse().unwrap_or(0.0);
+                if sel == "floatValue" {
+                    cpu.set_f32(0, f as f32);
+                } else {
+                    cpu.set_f64(0, f);
+                }
+                return true;
+            }
+            ("NSString", false, "boolValue") => {
+                let s = self.str_of(mem, recv).unwrap_or_default();
+                let t = s.trim().to_lowercase();
+                ret!((t.starts_with('y') || t.starts_with('t') || t.starts_with('1')) as u64)
+            }
+            ("NSMutableString", false, "appendString:") => {
+                let add = self.str_of(mem, a2).unwrap_or_default();
+                if let Some(Obj::Str(s)) = self.objs.get_mut(&recv) {
+                    s.push_str(&add);
+                }
+                self.cstr_cache.remove(&recv);
+                return true;
+            }
+            ("NSMutableString", false, "appendFormat:") => {
+                let fmt = self.str_of(mem, a2).unwrap_or_default();
+                // a2 is the format; the arguments follow on the stack
+                let add = self.ns_format(mem, &fmt, sp);
+                if let Some(Obj::Str(s)) = self.objs.get_mut(&recv) {
+                    s.push_str(&add);
+                }
+                self.cstr_cache.remove(&recv);
+                return true;
+            }
+            ("NSMutableString", false, "setString:") => {
+                let new = self.str_of(mem, a2).unwrap_or_default();
+                self.objs.insert(recv, Obj::Str(new));
+                self.cstr_cache.remove(&recv);
+                return true;
+            }
+
+            // ----- NSNumber -----
+            ("NSNumber", true, "numberWithBool:") => {
+                let o = self.new_obj(mem, "NSNumber", Obj::Num(Num::from_bool(a2 as u8 != 0)));
+                ret!(o)
+            }
+            ("NSNumber", true, "numberWithInt:") | ("NSNumber", true, "numberWithChar:") | ("NSNumber", true, "numberWithShort:") => {
+                let o = self.new_obj(mem, "NSNumber", Obj::Num(Num::int(a2 as i32 as i64)));
+                ret!(o)
+            }
+            ("NSNumber", true, "numberWithUnsignedInt:") => {
+                let o = self.new_obj(mem, "NSNumber", Obj::Num(Num::int(a2 as u32 as i64)));
+                ret!(o)
+            }
+            ("NSNumber", true, "numberWithInteger:")
+            | ("NSNumber", true, "numberWithLong:")
+            | ("NSNumber", true, "numberWithLongLong:")
+            | ("NSNumber", true, "numberWithUnsignedInteger:")
+            | ("NSNumber", true, "numberWithUnsignedLong:")
+            | ("NSNumber", true, "numberWithUnsignedLongLong:") => {
+                let o = self.new_obj(mem, "NSNumber", Obj::Num(Num::int(a2 as i64)));
+                ret!(o)
+            }
+            ("NSNumber", true, "numberWithDouble:") => {
+                let f = cpu.f64(0);
+                let o = self.new_obj(mem, "NSNumber", Obj::Num(Num::dbl(f)));
+                ret!(o)
+            }
+            ("NSNumber", true, "numberWithFloat:") => {
+                let f = cpu.f32(0) as f64;
+                let o = self.new_obj(mem, "NSNumber", Obj::Num(Num::dbl(f)));
+                ret!(o)
+            }
+            ("NSNumber", false, "boolValue") => {
+                let n = self.num_of(recv).map_or(0, |n| n.as_i64());
+                ret!((n != 0) as u64)
+            }
+            ("NSNumber", false, "intValue")
+            | ("NSNumber", false, "integerValue")
+            | ("NSNumber", false, "longValue")
+            | ("NSNumber", false, "longLongValue")
+            | ("NSNumber", false, "unsignedIntValue")
+            | ("NSNumber", false, "unsignedIntegerValue")
+            | ("NSNumber", false, "unsignedLongLongValue")
+            | ("NSNumber", false, "charValue") => {
+                let n = self.num_of(recv).map_or(0, |n| n.as_i64());
+                ret!(n as u64)
+            }
+            ("NSNumber", false, "doubleValue") => {
+                let f = self.num_of(recv).map_or(0.0, |n| n.as_f64());
+                cpu.set_f64(0, f);
+                return true;
+            }
+            ("NSNumber", false, "floatValue") => {
+                let f = self.num_of(recv).map_or(0.0, |n| n.as_f64());
+                cpu.set_f32(0, f as f32);
+                return true;
+            }
+            ("NSNumber", false, "isEqualToNumber:") | ("NSNumber", false, "isEqual:") => {
+                let eq = self.obj_eq(mem, recv, a2);
+                ret!(eq as u64)
+            }
+            ("NSNumber", false, "hash") => {
+                let h = self.num_of(recv).map_or(recv, |n| n.as_i64() as u64);
+                ret!(h)
+            }
+            ("NSNumber", false, "description") | ("NSNumber", false, "stringValue") => {
+                let d = self.description(mem, recv);
+                let o = self.new_string(mem, &d);
+                ret!(o)
+            }
+            ("NSNumber", false, "copy") | ("NSNumber", false, "copyWithZone:") => ret!(recv),
+
+            // ----- NSArray / NSMutableArray -----
+            ("NSArray", true, "array") => {
+                let c = self.class_name(recv);
+                let o = self.new_obj(mem, &c, Obj::Array(Vec::new()));
+                ret!(o)
+            }
+            ("NSArray", true, "arrayWithObject:") => {
+                let c = self.class_name(recv);
+                let o = self.new_obj(mem, &c, Obj::Array(vec![a2]));
+                ret!(o)
+            }
+            ("NSArray", true, "arrayWithObjects:") => {
+                let c = self.class_name(recv);
+                let mut items = Vec::new();
+                let mut o = a2;
+                let mut slot = 0u64;
+                while o != 0 && slot < 4000 {
+                    items.push(o);
+                    o = mem.read_u64(sp.wrapping_add(slot * 8)).unwrap_or(0);
+                    slot += 1;
+                }
+                let arr = self.new_obj(mem, &c, Obj::Array(items));
+                ret!(arr)
+            }
+            ("NSArray", true, "arrayWithArray:") => {
+                let c = self.class_name(recv);
+                let items = match self.objs.get(&a2) {
+                    Some(Obj::Array(v)) => v.clone(),
+                    _ => Vec::new(),
+                };
+                let o = self.new_obj(mem, &c, Obj::Array(items));
+                ret!(o)
+            }
+            ("NSArray", false, "initWithCapacity:") | ("NSArray", false, "init") => ret!(recv),
+            ("NSArray", false, "count") => {
+                let n = match self.objs.get(&recv) {
+                    Some(Obj::Array(v)) => v.len(),
+                    _ => 0,
+                };
+                ret!(n as u64)
+            }
+            ("NSArray", false, "objectAtIndex:") | ("NSArray", false, "objectAtIndexedSubscript:") => {
+                let o = match self.objs.get(&recv) {
+                    Some(Obj::Array(v)) => v.get(a2 as usize).copied().unwrap_or(0),
+                    _ => 0,
+                };
+                ret!(o)
+            }
+            ("NSArray", false, "firstObject") | ("NSArray", false, "lastObject") => {
+                let o = match self.objs.get(&recv) {
+                    Some(Obj::Array(v)) => {
+                        let e = if sel == "firstObject" { v.first() } else { v.last() };
+                        e.copied().unwrap_or(0)
+                    }
+                    _ => 0,
+                };
+                ret!(o)
+            }
+            ("NSArray", false, "containsObject:") | ("NSArray", false, "indexOfObject:") => {
+                let items = match self.objs.get(&recv) {
+                    Some(Obj::Array(v)) => v.clone(),
+                    _ => Vec::new(),
+                };
+                let idx = items.iter().position(|o| self.obj_eq(mem, *o, a2));
+                if sel == "containsObject:" {
+                    ret!(idx.is_some() as u64)
+                }
+                ret!(idx.map_or(NS_NOT_FOUND, |i| i as u64))
+            }
+            ("NSArray", false, "addObject:") => {
+                if let Some(Obj::Array(v)) = self.objs.get_mut(&recv) {
+                    v.push(a2);
+                }
+                return true;
+            }
+            ("NSArray", false, "addObjectsFromArray:") => {
+                let more = match self.objs.get(&a2) {
+                    Some(Obj::Array(v)) => v.clone(),
+                    _ => Vec::new(),
+                };
+                if let Some(Obj::Array(v)) = self.objs.get_mut(&recv) {
+                    v.extend(more);
+                }
+                return true;
+            }
+            ("NSArray", false, "insertObject:atIndex:") => {
+                if let Some(Obj::Array(v)) = self.objs.get_mut(&recv) {
+                    let at = (a3 as usize).min(v.len());
+                    v.insert(at, a2);
+                }
+                return true;
+            }
+            ("NSArray", false, "removeAllObjects") => {
+                if let Some(Obj::Array(v)) = self.objs.get_mut(&recv) {
+                    v.clear();
+                }
+                return true;
+            }
+            ("NSArray", false, "removeLastObject") => {
+                if let Some(Obj::Array(v)) = self.objs.get_mut(&recv) {
+                    v.pop();
+                }
+                return true;
+            }
+            ("NSArray", false, "removeObjectAtIndex:") => {
+                if let Some(Obj::Array(v)) = self.objs.get_mut(&recv) {
+                    if (a2 as usize) < v.len() {
+                        v.remove(a2 as usize);
+                    }
+                }
+                return true;
+            }
+            ("NSArray", false, "removeObject:") => {
+                let items = match self.objs.get(&recv) {
+                    Some(Obj::Array(v)) => v.clone(),
+                    _ => Vec::new(),
+                };
+                let keep: Vec<u64> = items.into_iter().filter(|o| !self.obj_eq(mem, *o, a2)).collect();
+                if let Some(Obj::Array(v)) = self.objs.get_mut(&recv) {
+                    *v = keep;
+                }
+                return true;
+            }
+            ("NSArray", false, "copy") | ("NSArray", false, "mutableCopy") | ("NSArray", false, "copyWithZone:") => {
+                let items = match self.objs.get(&recv) {
+                    Some(Obj::Array(v)) => v.clone(),
+                    _ => Vec::new(),
+                };
+                let c = if sel == "mutableCopy" { "NSMutableArray" } else { "NSArray" };
+                let o = self.new_obj(mem, c, Obj::Array(items));
+                ret!(o)
+            }
+            ("NSArray", false, "componentsJoinedByString:") => {
+                let sep = self.str_of(mem, a2).unwrap_or_default();
+                let items = match self.objs.get(&recv) {
+                    Some(Obj::Array(v)) => v.clone(),
+                    _ => Vec::new(),
+                };
+                let parts: Vec<String> = items.iter().map(|o| self.description(mem, *o)).collect();
+                let o = self.new_string(mem, &parts.join(&sep));
+                ret!(o)
+            }
+
+            // ----- NSDictionary / NSMutableDictionary / NSUserDefaults -----
+            ("NSDictionary", true, "dictionary") => {
+                let c = self.class_name(recv);
+                let o = self.new_obj(mem, &c, Obj::Dict(Vec::new()));
+                ret!(o)
+            }
+            ("NSDictionary", true, "dictionaryWithObject:forKey:") => {
+                let c = self.class_name(recv);
+                let d = self.new_obj(mem, &c, Obj::Dict(Vec::new()));
+                self.dict_set(mem, d, a3, a2);
+                ret!(d)
+            }
+            ("NSDictionary", true, "dictionaryWithDictionary:") => {
+                let c = self.class_name(recv);
+                let pairs = match self.objs.get(&a2) {
+                    Some(Obj::Dict(v)) => v.clone(),
+                    _ => Vec::new(),
+                };
+                let o = self.new_obj(mem, &c, Obj::Dict(pairs));
+                ret!(o)
+            }
+            ("NSDictionary", true, "dictionaryWithObjectsAndKeys:") => {
+                // object1, key1, object2, key2, ..., nil
+                let c = self.class_name(recv);
+                let mut pairs = Vec::new();
+                let (mut obj, mut slot) = (a2, 0u64);
+                while obj != 0 && slot < 4000 {
+                    let key = mem.read_u64(sp.wrapping_add(slot * 8)).unwrap_or(0);
+                    if key == 0 {
+                        break;
+                    }
+                    pairs.push((key, obj));
+                    obj = mem.read_u64(sp.wrapping_add((slot + 1) * 8)).unwrap_or(0);
+                    slot += 2;
+                }
+                let d = self.new_obj(mem, &c, Obj::Dict(Vec::new()));
+                for (k, v) in pairs {
+                    self.dict_set(mem, d, k, v);
+                }
+                ret!(d)
+            }
+            ("NSDictionary", false, "initWithCapacity:") | ("NSDictionary", false, "init") => ret!(recv),
+            ("NSDictionary", false, "count") => {
+                let n = match self.objs.get(&recv) {
+                    Some(Obj::Dict(v)) => v.len(),
+                    _ => 0,
+                };
+                ret!(n as u64)
+            }
+            ("NSDictionary", false, "objectForKey:")
+            | ("NSDictionary", false, "objectForKeyedSubscript:")
+            | ("NSDictionary", false, "valueForKey:") => {
+                let v = self.dict_get(mem, recv, a2);
+                ret!(v)
+            }
+            ("NSDictionary", false, "allKeys") | ("NSDictionary", false, "allValues") => {
+                let items: Vec<u64> = match self.objs.get(&recv) {
+                    Some(Obj::Dict(v)) => v.iter().map(|(k, val)| if sel == "allKeys" { *k } else { *val }).collect(),
+                    _ => Vec::new(),
+                };
+                let o = self.new_obj(mem, "NSArray", Obj::Array(items));
+                ret!(o)
+            }
+            ("NSDictionary", false, "setObject:forKey:") => {
+                self.dict_set(mem, recv, a3, a2);
+                return true;
+            }
+            ("NSDictionary", false, "setObject:forKeyedSubscript:") => {
+                // dict[key] = object; a nil object removes the key
+                if a2 == 0 {
+                    if let Some(i) = self.dict_find(mem, recv, a3) {
+                        if let Some(Obj::Dict(v)) = self.objs.get_mut(&recv) {
+                            v.remove(i);
+                        }
+                    }
+                } else {
+                    self.dict_set(mem, recv, a3, a2);
+                }
+                return true;
+            }
+            ("NSDictionary", false, "removeObjectForKey:") => {
+                if let Some(i) = self.dict_find(mem, recv, a2) {
+                    if let Some(Obj::Dict(v)) = self.objs.get_mut(&recv) {
+                        v.remove(i);
+                    }
+                }
+                return true;
+            }
+            ("NSDictionary", false, "removeAllObjects") => {
+                if let Some(Obj::Dict(v)) = self.objs.get_mut(&recv) {
+                    v.clear();
+                }
+                return true;
+            }
+            ("NSDictionary", false, "addEntriesFromDictionary:") => {
+                let pairs = match self.objs.get(&a2) {
+                    Some(Obj::Dict(v)) => v.clone(),
+                    _ => Vec::new(),
+                };
+                for (k, v) in pairs {
+                    self.dict_set(mem, recv, k, v);
+                }
+                return true;
+            }
+            ("NSDictionary", false, "copy") | ("NSDictionary", false, "mutableCopy") | ("NSDictionary", false, "copyWithZone:") => {
+                let pairs = match self.objs.get(&recv) {
+                    Some(Obj::Dict(v)) => v.clone(),
+                    _ => Vec::new(),
+                };
+                let c = if sel == "mutableCopy" { "NSMutableDictionary" } else { "NSDictionary" };
+                let o = self.new_obj(mem, c, Obj::Dict(pairs));
+                ret!(o)
+            }
+            ("NSUserDefaults", true, "standardUserDefaults") => {
+                let o = self.singleton(mem, "NSUserDefaults", "NSUserDefaults", Obj::Dict(Vec::new()));
+                ret!(o)
+            }
+            ("NSUserDefaults", false, "synchronize") => ret!(1),
+            ("NSUserDefaults", false, "boolForKey:") | ("NSUserDefaults", false, "integerForKey:") => {
+                let v = self.dict_get(mem, recv, a2);
+                let n = self.num_of(v).map_or(0, |n| n.as_i64());
+                ret!(if sel == "boolForKey:" { (n != 0) as u64 } else { n as u64 })
+            }
+            ("NSUserDefaults", false, "doubleForKey:") | ("NSUserDefaults", false, "floatForKey:") => {
+                let v = self.dict_get(mem, recv, a2);
+                let f = self.num_of(v).map_or(0.0, |n| n.as_f64());
+                if sel == "floatForKey:" {
+                    cpu.set_f32(0, f as f32);
+                } else {
+                    cpu.set_f64(0, f);
+                }
+                return true;
+            }
+            ("NSUserDefaults", false, "stringForKey:") | ("NSUserDefaults", false, "arrayForKey:") | ("NSUserDefaults", false, "dictionaryForKey:") => {
+                let v = self.dict_get(mem, recv, a2);
+                ret!(v)
+            }
+            ("NSUserDefaults", false, "setBool:forKey:") => {
+                let n = self.new_obj(mem, "NSNumber", Obj::Num(Num::from_bool(a2 as u8 != 0)));
+                self.dict_set(mem, recv, a3, n);
+                return true;
+            }
+            ("NSUserDefaults", false, "setInteger:forKey:") => {
+                let n = self.new_obj(mem, "NSNumber", Obj::Num(Num::int(a2 as i64)));
+                self.dict_set(mem, recv, a3, n);
+                return true;
+            }
+            ("NSUserDefaults", false, "setDouble:forKey:") => {
+                let f = cpu.f64(0);
+                let n = self.new_obj(mem, "NSNumber", Obj::Num(Num::dbl(f)));
+                self.dict_set(mem, recv, a2, n);
+                return true;
+            }
+            ("NSUserDefaults", false, "setFloat:forKey:") => {
+                let f = cpu.f32(0) as f64;
+                let n = self.new_obj(mem, "NSNumber", Obj::Num(Num::dbl(f)));
+                self.dict_set(mem, recv, a2, n);
+                return true;
+            }
+            ("NSUserDefaults", false, "registerDefaults:") => {
+                let pairs = match self.objs.get(&a2) {
+                    Some(Obj::Dict(v)) => v.clone(),
+                    _ => Vec::new(),
+                };
+                for (k, v) in pairs {
+                    if self.dict_find(mem, recv, k).is_none() {
+                        self.dict_set(mem, recv, k, v);
+                    }
+                }
+                return true;
+            }
+
+            // ----- NSBundle -----
+            ("NSBundle", true, "mainBundle") | ("NSBundle", true, "bundleForClass:") | ("NSBundle", true, "bundleWithPath:") => {
+                let o = self.singleton(mem, "NSBundle", "NSBundle", Obj::Plain);
+                ret!(o)
+            }
+            ("NSBundle", false, "bundlePath") | ("NSBundle", false, "resourcePath") => {
+                let p = self.bundle_path.clone();
+                let o = self.new_string(mem, &p);
+                ret!(o)
+            }
+            ("NSBundle", false, "executablePath") => {
+                let p = format!("{}/{}", self.bundle_path, self.exe_name);
+                let o = self.new_string(mem, &p);
+                ret!(o)
+            }
+            ("NSBundle", false, "bundleIdentifier") => {
+                let p = self.bundle_id.clone();
+                let o = self.new_string(mem, &p);
+                ret!(o)
+            }
+            ("NSBundle", false, "pathForResource:ofType:") | ("NSBundle", false, "pathForResource:ofType:inDirectory:") => {
+                let Some(file) = self.str_of(mem, a2) else { ret!(0) };
+                let ext = self.str_of(mem, a3);
+                let dir = if sel.ends_with("inDirectory:") { self.str_of(mem, a4) } else { None };
+                let mut p = self.bundle_path.clone();
+                if let Some(d) = dir {
+                    p = format!("{p}/{d}");
+                }
+                p = match ext {
+                    Some(e) if !e.is_empty() => format!("{p}/{file}.{e}"),
+                    _ => format!("{p}/{file}"),
+                };
+                self.log_once(format!("NSBundle {sel} -> {p}"));
+                let o = self.new_string(mem, &p);
+                ret!(o)
+            }
+            ("NSBundle", false, "infoDictionary") => {
+                let o = self.singleton(mem, "InfoDictionary", "NSDictionary", Obj::Dict(Vec::new()));
+                ret!(o)
+            }
+            ("NSBundle", false, "objectForInfoDictionaryKey:") => {
+                let key = self.str_of(mem, a2).unwrap_or_default();
+                let v = match key.as_str() {
+                    "CFBundleIdentifier" => self.bundle_id.clone(),
+                    "CFBundleName" | "CFBundleDisplayName" | "CFBundleExecutable" => self.exe_name.clone(),
+                    _ => String::new(),
+                };
+                if v.is_empty() {
+                    ret!(0)
+                }
+                let o = self.new_string(mem, &v);
+                ret!(o)
+            }
+
+            // ----- NSFileManager -----
+            ("NSFileManager", true, "defaultManager") => {
+                let o = self.singleton(mem, "NSFileManager", "NSFileManager", Obj::Plain);
+                ret!(o)
+            }
+            ("NSFileManager", false, "fileExistsAtPath:") | ("NSFileManager", false, "fileExistsAtPath:isDirectory:") => {
+                let path = self.str_of(mem, a2).unwrap_or_default();
+                self.log_once(format!("NSFileManager {sel} {path}"));
+                if sel.ends_with("isDirectory:") && a3 != 0 {
+                    mem.write_slice(a3, &[0u8]);
+                }
+                ret!(path.starts_with(&self.bundle_path) as u64)
+            }
+            ("NSFileManager", false, "createDirectoryAtPath:withIntermediateDirectories:attributes:error:")
+            | ("NSFileManager", false, "removeItemAtPath:error:")
+            | ("NSFileManager", false, "copyItemAtPath:toPath:error:")
+            | ("NSFileManager", false, "moveItemAtPath:toPath:error:")
+            | ("NSFileManager", false, "createFileAtPath:contents:attributes:") => {
+                let path = self.str_of(mem, a2).unwrap_or_default();
+                self.log_once(format!("NSFileManager {sel} {path}"));
+                ret!(1)
+            }
+            ("NSFileManager", false, "isReadableFileAtPath:") | ("NSFileManager", false, "isWritableFileAtPath:") => {
+                let path = self.str_of(mem, a2).unwrap_or_default();
+                self.log_once(format!("NSFileManager {sel} {path}"));
+                ret!(1)
+            }
+            ("NSFileManager", false, "contentsOfDirectoryAtPath:error:") => {
+                let o = self.new_obj(mem, "NSArray", Obj::Array(Vec::new()));
+                ret!(o)
+            }
+            ("NSFileManager", false, "URLsForDirectory:inDomains:") => {
+                let sub = match a2 {
+                    5 => "Library",
+                    13 => "Library/Caches",
+                    14 => "Library/Application Support",
+                    _ => "Documents",
+                };
+                let url = self.new_obj(mem, "NSURL", Obj::Url(format!("{SANDBOX}/{sub}")));
+                let o = self.new_obj(mem, "NSArray", Obj::Array(vec![url]));
+                ret!(o)
+            }
+
+            // ----- NSURL -----
+            ("NSURL", true, "fileURLWithPath:") | ("NSURL", true, "fileURLWithPath:isDirectory:") | ("NSURL", true, "URLWithString:") => {
+                let s = self.str_of(mem, a2).unwrap_or_default();
+                let o = self.new_obj(mem, "NSURL", Obj::Url(s));
+                ret!(o)
+            }
+            ("NSURL", false, "path") | ("NSURL", false, "relativePath") | ("NSURL", false, "description") => {
+                let s = self.str_of(mem, recv).unwrap_or_default();
+                let o = self.new_string(mem, &s);
+                ret!(o)
+            }
+            ("NSURL", false, "absoluteString") => {
+                let s = self.str_of(mem, recv).unwrap_or_default();
+                let s = if s.starts_with('/') { format!("file://{s}") } else { s };
+                let o = self.new_string(mem, &s);
+                ret!(o)
+            }
+            ("NSURL", false, "isFileURL") => {
+                let s = self.str_of(mem, recv).unwrap_or_default();
+                ret!(s.starts_with('/') as u64)
+            }
+            ("NSURL", false, "lastPathComponent") => {
+                let s = self.str_of(mem, recv).unwrap_or_default();
+                let last = s.trim_end_matches('/').rsplit('/').next().unwrap_or("").to_string();
+                let o = self.new_string(mem, &last);
+                ret!(o)
+            }
+            ("NSURL", false, "fileSystemRepresentation") => {
+                let p = self.utf8_ptr(mem, recv);
+                ret!(p)
+            }
+            ("NSURL", false, "absoluteURL") | ("NSURL", false, "standardizedURL") | ("NSURL", false, "copy") => ret!(recv),
+
+            // ----- UIDevice / UIScreen -----
+            ("UIDevice", true, "currentDevice") => {
+                let o = self.singleton(mem, "UIDevice", "UIDevice", Obj::Plain);
+                ret!(o)
+            }
+            ("UIDevice", false, "systemVersion") => {
+                let o = self.new_string(mem, "10.3.3");
+                ret!(o)
+            }
+            ("UIDevice", false, "systemName") => {
+                let o = self.new_string(mem, "iOS");
+                ret!(o)
+            }
+            ("UIDevice", false, "model") | ("UIDevice", false, "localizedModel") | ("UIDevice", false, "name") => {
+                let o = self.new_string(mem, "iPhone");
+                ret!(o)
+            }
+            ("UIDevice", false, "userInterfaceIdiom") => ret!(0),
+            ("UIDevice", false, "orientation") => ret!(3),
+            ("UIScreen", true, "mainScreen") => {
+                let o = self.singleton(mem, "UIScreen", "UIScreen", Obj::Plain);
+                ret!(o)
+            }
+            ("UIScreen", false, "bounds") | ("UIScreen", false, "applicationFrame") => {
+                cpu.set_f64(0, 0.0);
+                cpu.set_f64(1, 0.0);
+                cpu.set_f64(2, SCREEN_W);
+                cpu.set_f64(3, SCREEN_H);
+                return true;
+            }
+            ("UIScreen", false, "nativeBounds") => {
+                cpu.set_f64(0, 0.0);
+                cpu.set_f64(1, 0.0);
+                cpu.set_f64(2, SCREEN_W * SCREEN_SCALE);
+                cpu.set_f64(3, SCREEN_H * SCREEN_SCALE);
+                return true;
+            }
+            ("UIScreen", false, "scale") | ("UIScreen", false, "nativeScale") => {
+                cpu.set_f64(0, SCREEN_SCALE);
+                return true;
+            }
+
+            // ----- UIKit objects: just enough to be created -----
+            ("UIView", false, "initWithFrame:") | ("UIViewController", false, "init") | ("UIViewController", false, "initWithNibName:bundle:") => ret!(recv),
+
+            // ----- notifications, process, pools, threads -----
+            ("NSNotificationCenter", true, "defaultCenter") => {
+                let o = self.singleton(mem, "NSNotificationCenter", "NSNotificationCenter", Obj::Plain);
+                ret!(o)
+            }
+            ("NSNotificationCenter", false, s)
+                if s.starts_with("addObserver") || s.starts_with("removeObserver") || s.starts_with("postNotification") =>
+            {
+                if s.starts_with("addObserverForName") {
+                    let token = self.new_obj(mem, "NSObject", Obj::Plain);
+                    ret!(token)
+                }
+                return true;
+            }
+            ("NSProcessInfo", true, "processInfo") => {
+                let o = self.singleton(mem, "NSProcessInfo", "NSProcessInfo", Obj::Plain);
+                ret!(o)
+            }
+            ("NSProcessInfo", false, "processName") => {
+                let n = self.exe_name.clone();
+                let o = self.new_string(mem, &n);
+                ret!(o)
+            }
+            ("NSProcessInfo", false, "arguments") => {
+                let o = self.new_obj(mem, "NSArray", Obj::Array(Vec::new()));
+                ret!(o)
+            }
+            ("NSProcessInfo", false, "environment") => {
+                let o = self.new_obj(mem, "NSDictionary", Obj::Dict(Vec::new()));
+                ret!(o)
+            }
+            ("NSProcessInfo", false, "systemUptime") => {
+                cpu.set_f64(0, 1000.0);
+                return true;
+            }
+            ("NSProcessInfo", false, "processorCount") | ("NSProcessInfo", false, "activeProcessorCount") => ret!(6),
+            ("NSProcessInfo", false, "physicalMemory") => ret!(3 * 1024 * 1024 * 1024),
+            ("NSAutoreleasePool", false, "drain") => return true,
+            ("NSThread", true, "detachNewThreadSelector:toTarget:withObject:") => {
+                // selector, target, object
+                self.pending_threads.push((a3, a2, a4));
+                return true;
+            }
+            ("NSThread", true, "isMainThread") => ret!(1),
+            ("NSThread", true, "currentThread") | ("NSThread", true, "mainThread") => {
+                let o = self.singleton(mem, "NSThread", "NSThread", Obj::Plain);
+                ret!(o)
+            }
+            ("NSThread", true, "sleepForTimeInterval:") => return true,
+            ("NSThread", false, "initWithTarget:selector:object:") => {
+                self.thread_inits.insert(recv, (a2, a3, a4));
+                ret!(recv)
+            }
+            ("NSThread", false, "start") => {
+                if let Some(t) = self.thread_inits.get(&recv).copied() {
+                    self.pending_threads.push(t);
+                }
+                return true;
+            }
+            ("NSThread", false, "isMainThread") => ret!(1),
+            ("NSThread", false, "setName:") | ("NSThread", false, "setStackSize:") | ("NSThread", false, "setThreadPriority:") => return true,
+            _ => return false,
+        }
+        true
     }
 
     fn handle(&mut self, cpu: &mut Cpu64, mem: &mut Mem64, id: u32) -> Flow {
@@ -1110,6 +2539,107 @@ impl Hle {
                 let c = self.objc.class_of(mem, x0).unwrap_or(0);
                 cpu.set_reg(0, c);
             }
+            Kind::ClassGetInstanceMethod | Kind::ClassGetClassMethod => {
+                let sel = self.objc.sel_name(mem, x1);
+                let start = if kind == Kind::ClassGetClassMethod {
+                    mem.read_u64(x0).unwrap_or(0)
+                } else {
+                    x0
+                };
+                let h = match self.objc.find_owner(start, &sel) {
+                    Some((owner, _)) => self.objc.method_handle(mem, &mut self.heap, owner, &sel),
+                    None => 0,
+                };
+                cpu.set_reg(0, h);
+            }
+            Kind::MethodGetImplementation => {
+                let imp = if x0 == 0 { 0 } else { mem.read_u64(x0.wrapping_add(16)).unwrap_or(0) };
+                cpu.set_reg(0, imp);
+            }
+            Kind::MethodGetTypeEncoding => {
+                // An empty C string.
+                let p = self.heap.alloc(16);
+                cpu.set_reg(0, p);
+            }
+            Kind::MethodSetImplementation => {
+                let old = self.objc.set_method_imp(mem, x0, x1);
+                cpu.set_reg(0, old);
+            }
+            Kind::MethodExchange => {
+                let i1 = mem.read_u64(x0.wrapping_add(16)).unwrap_or(0);
+                let i2 = mem.read_u64(x1.wrapping_add(16)).unwrap_or(0);
+                self.objc.set_method_imp(mem, x0, i2);
+                self.objc.set_method_imp(mem, x1, i1);
+            }
+            Kind::ClassAddMethod => {
+                let sel = self.objc.sel_name(mem, x1);
+                let added = match self.objc.classes.get_mut(&x0) {
+                    Some(c) if !c.methods.contains_key(&sel) => {
+                        c.methods.insert(sel, x2);
+                        true
+                    }
+                    _ => false,
+                };
+                cpu.set_reg(0, added as u64);
+            }
+            Kind::ClassReplaceMethod => {
+                let sel = self.objc.sel_name(mem, x1);
+                let old = self.objc.classes.get_mut(&x0).and_then(|c| c.methods.insert(sel, x2));
+                cpu.set_reg(0, old.unwrap_or(0));
+            }
+            Kind::ObjcGetProperty => {
+                // (self, _cmd, offset, atomic)
+                let v = mem.read_u64(x0.wrapping_add(x2)).unwrap_or(0);
+                cpu.set_reg(0, v);
+            }
+            Kind::ObjcSetProperty => {
+                // (self, _cmd, newValue, offset, ...)
+                mem.write_u64(x0.wrapping_add(cpu.reg(3)), x2);
+            }
+            Kind::GuardAcquire => {
+                // 1 = the caller must run the initializer
+                let done = mem.read_bytes(x0, 1).map_or(true, |b| b[0] != 0);
+                cpu.set_reg(0, if done { 0 } else { 1 });
+            }
+            Kind::GuardRelease => {
+                mem.write_slice(x0, &[1u8]);
+            }
+            Kind::DyldImageCount => cpu.set_reg(0, 1),
+            Kind::DyldImageName => {
+                if x0 == 0 {
+                    if self.exe_path_ptr == 0 {
+                        let path = format!("{}/{}", self.bundle_path, self.exe_name);
+                        self.exe_path_ptr = self.alloc_cstr(mem, &path);
+                    }
+                    cpu.set_reg(0, self.exe_path_ptr);
+                } else {
+                    cpu.set_reg(0, 0);
+                }
+            }
+            Kind::NsSearchPath => {
+                let dir = match x0 {
+                    5 => format!("{SANDBOX}/Library"),
+                    13 => format!("{SANDBOX}/Library/Caches"),
+                    14 => format!("{SANDBOX}/Library/Application Support"),
+                    _ => format!("{SANDBOX}/Documents"),
+                };
+                let s = self.new_string(mem, &dir);
+                let arr = self.new_obj(mem, "NSArray", Obj::Array(vec![s]));
+                cpu.set_reg(0, arr);
+            }
+            Kind::NsLog => {
+                let fmt = self.str_of(mem, x0).unwrap_or_default();
+                let text = self.ns_format(mem, &fmt, cpu.sp());
+                log!("[a64] NSLog: {text}");
+            }
+            Kind::NewHandle => {
+                let p = self.heap.alloc(32);
+                cpu.set_reg(0, p);
+            }
+            Kind::ReturnOne => cpu.set_reg(0, 1),
+            Kind::BlockObjectAssign => {
+                mem.write_u64(x0, x1);
+            }
             Kind::Unknown => {
                 if self.seen.insert(id) {
                     log!("[a64] first call to unimplemented {name} (from {lr:#x}); returning 0");
@@ -1317,6 +2847,7 @@ impl Machine {
             }
         }
         // The UIApplication object and the launch options are nil for now.
+        self.hle.calls = 0;
         match self.send(obj, "application:didFinishLaunchingWithOptions:", &[0, 0]) {
             CallEnd::Returned(r) => {
                 echo!("[a64] application:didFinishLaunchingWithOptions: returned {r:#x}");
@@ -1324,6 +2855,27 @@ impl Machine {
             CallEnd::Stopped(msg) => {
                 echo!("[a64] application:didFinishLaunchingWithOptions: stopped: {msg}");
                 self.brief_state();
+            }
+        }
+        // Threads the app started (often its game loop). Each runs for a
+        // limited time, so an endless loop ends up in the log, not as a hang.
+        let threads = std::mem::take(&mut self.hle.pending_threads);
+        for (target, sel_ptr, arg) in threads {
+            let sel = self.hle.objc.sel_name(&self.mem, sel_ptr);
+            let cname = self
+                .hle
+                .objc
+                .class_of(&self.mem, target)
+                .map(|c| self.hle.class_name(c))
+                .unwrap_or_default();
+            echo!("[a64] running a thread the app started: -[{cname} {sel}]");
+            self.hle.calls = 0;
+            match self.send(target, &sel, &[arg]) {
+                CallEnd::Returned(_) => echo!("[a64] the thread function returned"),
+                CallEnd::Stopped(msg) => {
+                    echo!("[a64] the thread stopped: {msg}");
+                    self.brief_state();
+                }
             }
         }
     }
@@ -1431,6 +2983,16 @@ pub fn run(bundle: &Bundle, exe: &[u8]) -> Result<(), String> {
         kinds,
         heap: Heap { next: HEAP_BASE, sizes: HashMap::new() },
         objc: Objc::default(),
+        objs: HashMap::new(),
+        singletons: HashMap::new(),
+        cstr_cache: HashMap::new(),
+        pending_threads: Vec::new(),
+        thread_inits: HashMap::new(),
+        bundle_path: format!("/var/containers/Bundle/Application/00000000-0000-0000-0000-000000000000/{name}.app"),
+        bundle_id: bundle.bundle_identifier().to_string(),
+        exe_name: name.clone(),
+        exe_path_ptr: 0,
+        seen_logs: HashSet::new(),
         seen: HashSet::new(),
         counts: HashMap::new(),
         calls: 0,
