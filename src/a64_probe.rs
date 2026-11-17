@@ -29,7 +29,7 @@ const STACK_BASE: u64 = 0x1_6fc0_0000;
 const STACK_SIZE: u64 = 0x40_0000; // 4 MiB
 const STACK_TOP: u64 = STACK_BASE + STACK_SIZE;
 const HEAP_BASE: u64 = 0x2_0000_0000;
-const HEAP_SIZE: u64 = 0x200_0000; // 32 MiB
+const HEAP_SIZE: u64 = 0x800_0000; // 128 MiB
 const STUB_BASE: u64 = 0x1_8000_0000;
 
 /// `svc` immediate used by the return trap. Everything below this is a stub.
@@ -38,7 +38,7 @@ const TRAP_SVC: u32 = 0xffff;
 /// into the guest may use before we decide it is stuck in a loop.
 const TICKS_PER_SLICE: u64 = 50_000_000;
 const MAX_SLICES: u32 = 40;
-const MAX_HLE_CALLS: u64 = 3_000_000;
+const MAX_HLE_CALLS: u64 = 30_000_000;
 
 // ---------------------------------------------------------------------------
 // Memory
@@ -162,6 +162,15 @@ enum Kind {
     PthreadKeyCreate,
     PthreadGetSpecific,
     PthreadSetSpecific,
+    ObjcMsgSend,
+    ObjcMsgSendSuper2,
+    ReturnX0,
+    ObjcStoreStrong,
+    ObjcGetClass,
+    NsClassFromString,
+    NsStringFromClass,
+    SelRegister,
+    ObjectGetClass,
     /// Not implemented: logs the first call and returns 0.
     Unknown,
 }
@@ -206,6 +215,25 @@ fn classify(name: &str) -> Kind {
         "_mach_absolute_time" => Kind::MachAbsTime,
         "_mach_timebase_info" => Kind::MachTimebase,
         "_UIApplicationMain" => Kind::UiApplicationMain,
+        "_objc_msgSend" => Kind::ObjcMsgSend,
+        "_objc_msgSendSuper2" => Kind::ObjcMsgSendSuper2,
+        "_objc_retain"
+        | "_objc_retainAutoreleasedReturnValue"
+        | "_objc_autorelease"
+        | "_objc_autoreleaseReturnValue"
+        | "_objc_retainAutorelease"
+        | "_objc_retainAutoreleaseReturnValue"
+        | "_objc_unsafeClaimAutoreleasedReturnValue"
+        | "_objc_claimAutoreleasedReturnValue"
+        | "_sel_getName" => Kind::ReturnX0,
+        "_objc_release" => Kind::Free,
+        "_objc_storeStrong" => Kind::ObjcStoreStrong,
+        "_objc_autoreleasePoolPush" | "_objc_autoreleasePoolPop" => Kind::ReturnZero,
+        "_sel_registerName" | "_sel_getUid" => Kind::SelRegister,
+        "_objc_getClass" | "_objc_lookUpClass" | "_objc_getRequiredClass" => Kind::ObjcGetClass,
+        "_NSClassFromString" => Kind::NsClassFromString,
+        "_NSStringFromClass" => Kind::NsStringFromClass,
+        "_object_getClass" => Kind::ObjectGetClass,
         _ => Kind::Unknown,
     }
 }
@@ -216,41 +244,195 @@ enum Flow {
     Done(String),
     /// Run guest function `pc(args)` to completion (e.g. the block given to
     /// `dispatch_once`), then continue the interrupted call with X0 = `result`.
-    CallGuest { pc: u64, args: Vec<u64>, result: u64 },
+    CallGuest { pc: u64, args: Vec<u64>, result: u64, retry_at: Option<u64> },
+    // `retry_at`: instead of setting X0 = result, jump back to the import stub at
+    // this address so the interrupted call is made again (used for +initialize).
 }
 
-/// All "high-level emulation" state: the imported functions and their
-/// bookkeeping.
-struct Hle {
-    names: Vec<String>,
-    kinds: Vec<Kind>,
-    heap_next: u64,
-    alloc_sizes: HashMap<u64, u64>,
-    seen: HashSet<u32>,
-    counts: HashMap<u32, u64>,
-    calls: u64,
-    recent: VecDeque<String>,
-    clock: u64,
-    once_done: HashSet<u64>,
-    tsd: HashMap<u64, u64>,
-    next_key: u64,
+// ---------------------------------------------------------------------------
+// Guest heap and Objective-C runtime
+//
+// Just enough of the Objective-C runtime to dispatch messages: the app's own
+// classes are read from the binary's metadata; system classes (NSObject,
+// UIView, ...) are created here as empty placeholders, so that the app can
+// subclass them. Messages nobody implements are answered with nil and logged,
+// which tells us what to implement next.
+
+struct Heap {
+    next: u64,
+    sizes: HashMap<u64, u64>,
 }
 
-impl Hle {
+impl Heap {
     fn alloc(&mut self, size: u64) -> u64 {
-        let size = size.max(1).checked_add(15).map(|s| s & !15);
-        let Some(size) = size else { return 0 };
-        let end = match self.heap_next.checked_add(size) {
-            Some(e) if e <= HEAP_BASE + HEAP_SIZE => e,
-            _ => {
-                log!("[a64] guest heap exhausted (asked for {size:#x} bytes)");
-                return 0;
-            }
-        };
-        let p = self.heap_next;
-        self.heap_next = end;
-        self.alloc_sizes.insert(p, size);
+        self.heap.alloc(size)
+    }
+
+    /// A zeroed instance of `cls` (as `+alloc` would make).
+    fn alloc_instance(&mut self, mem: &mut Mem64, cls: u64) -> u64 {
+        let size = self.objc.classes.get(&cls).map_or(0x40, |c| c.instance_size).max(16);
+        let p = self.heap.alloc(size);
+        mem.write_u64(p, cls);
         p
+    }
+
+    /// A constant-string object (like an `@"..."` literal) holding `text`.
+    fn make_string(&mut self, mem: &mut Mem64, text: &str) -> u64 {
+        let (cls, _) = self.objc.system_class(mem, &mut self.heap, "NSConstantString");
+        let bytes = text.as_bytes();
+        let chars = self.heap.alloc(bytes.len() as u64 + 1);
+        mem.write_slice(chars, bytes);
+        let obj = self.heap.alloc(32);
+        mem.write_u64(obj, cls);
+        mem.write_u64(obj + 8, 0x7c8);
+        mem.write_u64(obj + 16, chars);
+        mem.write_u64(obj + 24, bytes.len() as u64);
+        obj
+    }
+
+    /// `objc_msgSend`: find the method and jump to it (app code), or run a
+    /// built-in, or answer nil. `start` is the class to start searching at
+    /// for `super` sends.
+    #[allow(clippy::too_many_arguments)]
+    fn msg_send(
+        &mut self,
+        cpu: &mut Cpu64,
+        mem: &mut Mem64,
+        recv: u64,
+        sel_ptr: u64,
+        start: Option<u64>,
+        stub_addr: u64,
+        lr: u64,
+    ) -> Flow {
+        if recv == 0 {
+            // Messages to nil return 0.
+            cpu.set_reg(0, 0);
+            for i in 0..4 {
+                cpu.set_vec(i, 0);
+            }
+            return Flow::Continue;
+        }
+        let sel = self.objc.sel_name(mem, sel_ptr);
+        let Some(cls) = self.objc.class_of(mem, recv) else {
+            let key = format!("message {sel} sent to {recv:#x}, which is not an object");
+            let n = self.objc.unhandled.entry(key.clone()).or_insert(0);
+            *n += 1;
+            if *n == 1 {
+                log!("[a64] {key} (from {lr:#x})");
+            }
+            cpu.set_reg(0, 0);
+            return Flow::Continue;
+        };
+        let recv_is_class = self.objc.classes.get(&recv).map_or(false, |c| !c.is_meta);
+        // First message to a class: run +initialize (superclass first), then
+        // send this message again.
+        if start.is_none() && recv_is_class && !self.objc.classes[&recv].initialized {
+            if let Some((imp, c)) = self.objc.pending_initialize(mem, recv) {
+                let s = self.objc.intern_sel(mem, &mut self.heap, "initialize");
+                return Flow::CallGuest { pc: imp, args: vec![c, s], result: 0, retry_at: Some(stub_addr) };
+            }
+        }
+        if let Some(imp) = self.objc.find(start.unwrap_or(cls), &sel) {
+            // Tail call: the method returns straight to our caller.
+            cpu.set_pc(imp);
+            return Flow::Continue;
+        }
+        if let Some(flow) = self.nsobject_builtin(cpu, mem, recv, cls, &sel, stub_addr, lr) {
+            return flow;
+        }
+        let (is_meta, cname) = {
+            let ci = &self.objc.classes[&cls];
+            (ci.is_meta, ci.name.clone())
+        };
+        let key = format!("{}[{} {}]", if is_meta { '+' } else { '-' }, cname, sel);
+        let n = self.objc.unhandled.entry(key.clone()).or_insert(0);
+        *n += 1;
+        if *n == 1 {
+            log!("[a64] unhandled message {key} (from {lr:#x}); answering nil");
+        }
+        cpu.set_reg(0, 0);
+        for i in 0..4 {
+            cpu.set_vec(i, 0);
+        }
+        Flow::Continue
+    }
+
+    /// The few NSObject methods we implement ourselves. `None` = not one of
+    /// them.
+    #[allow(clippy::too_many_arguments)]
+    fn nsobject_builtin(
+        &mut self,
+        cpu: &mut Cpu64,
+        mem: &mut Mem64,
+        recv: u64,
+        cls: u64,
+        sel: &str,
+        stub_addr: u64,
+        lr: u64,
+    ) -> Option<Flow> {
+        let recv_is_class = self.objc.classes.get(&recv).map_or(false, |c| !c.is_meta);
+        let (x2, x3) = (cpu.reg(2), cpu.reg(3));
+        match sel {
+            "alloc" | "allocWithZone:" if recv_is_class => {
+                let p = self.alloc_instance(mem, recv);
+                cpu.set_reg(0, p);
+            }
+            "new" if recv_is_class => {
+                let p = self.alloc_instance(mem, recv);
+                cpu.set_reg(0, p);
+                let s = self.objc.intern_sel(mem, &mut self.heap, "init");
+                cpu.set_reg(1, s);
+                return Some(self.msg_send(cpu, mem, p, s, None, stub_addr, lr));
+            }
+            // These return the receiver, which is already in X0.
+            "init" | "self" | "retain" | "autorelease" => {}
+            "release" | "dealloc" | "load" | "initialize" => {}
+            "class" => {
+                let c = if recv_is_class { recv } else { cls };
+                cpu.set_reg(0, c);
+            }
+            "superclass" => {
+                let c = if recv_is_class { recv } else { cls };
+                let s = self.objc.classes.get(&c).map_or(0, |i| i.superclass);
+                cpu.set_reg(0, s);
+            }
+            "isEqual:" => cpu.set_reg(0, (recv == x2) as u64),
+            "hash" => cpu.set_reg(0, recv),
+            "isKindOfClass:" | "isMemberOfClass:" => {
+                let (mut c, mut res) = (cls, false);
+                for _ in 0..64 {
+                    if c == x2 {
+                        res = true;
+                        break;
+                    }
+                    if sel == "isMemberOfClass:" {
+                        break;
+                    }
+                    let sup = self.objc.classes.get(&c).map_or(0, |i| i.superclass);
+                    if sup == 0 || sup == c {
+                        break;
+                    }
+                    c = sup;
+                }
+                cpu.set_reg(0, res as u64);
+            }
+            "respondsToSelector:" => {
+                let n = self.objc.sel_name(mem, x2);
+                let found = self.objc.find(cls, &n).is_some() || BUILTIN_SELS.contains(&n.as_str());
+                cpu.set_reg(0, found as u64);
+            }
+            "performSelector:" => {
+                cpu.set_reg(1, x2);
+                return Some(self.msg_send(cpu, mem, recv, x2, None, stub_addr, lr));
+            }
+            "performSelector:withObject:" => {
+                cpu.set_reg(1, x2);
+                cpu.set_reg(2, x3);
+                return Some(self.msg_send(cpu, mem, recv, x2, None, stub_addr, lr));
+            }
+            _ => return None,
+        }
+        Some(Flow::Continue)
     }
 
     fn handle(&mut self, cpu: &mut Cpu64, mem: &mut Mem64, id: u32) -> Flow {
@@ -260,6 +442,7 @@ impl Hle {
         self.calls += 1;
         *self.counts.entry(id).or_insert(0) += 1;
         let lr = cpu.lr();
+        let stub_addr = STUB_BASE + id as u64 * 8;
         let name = &self.names[id as usize];
         if self.recent.len() >= 40 {
             self.recent.pop_front();
@@ -279,7 +462,7 @@ impl Hle {
             Kind::Realloc => {
                 let new = self.alloc(x1);
                 if x0 != 0 && new != 0 {
-                    let old_size = self.alloc_sizes.get(&x0).copied().unwrap_or(0);
+                    let old_size = self.heap.sizes.get(&x0).copied().unwrap_or(0);
                     let n = old_size.min(x1) as usize;
                     if let Some(data) = mem.read_bytes(x0, n).map(|s| s.to_vec()) {
                         mem.write_slice(new, &data);
@@ -367,11 +550,13 @@ impl Hle {
                 cpu.set_reg(0, 0);
             }
             Kind::UiApplicationMain => {
+                // argc, argv, principal class name, delegate class name
+                self.objc.app_main = Some((x2, cpu.reg(3)));
                 return Flow::Done(
                     "SUCCESS: main() ran and reached UIApplicationMain. The 64-bit loader, \
                      CPU and start-up code work."
                         .into(),
-                )
+                );
             }
             Kind::Strncpy => {
                 let n = x2 as usize;
@@ -442,7 +627,7 @@ impl Hle {
                     // Block layout: isa, flags+reserved, invoke, descriptor.
                     match mem.read_u64(x1.wrapping_add(16)) {
                         Some(invoke) if invoke != 0 => {
-                            return Flow::CallGuest { pc: invoke, args: vec![x1], result: 0 }
+                            return Flow::CallGuest { pc: invoke, args: vec![x1], result: 0, retry_at: None }
                         }
                         _ => return Flow::Done(format!("dispatch_once: bad block {x1:#x}")),
                     }
@@ -451,12 +636,12 @@ impl Hle {
             Kind::DispatchOnceF => {
                 if mem.read_u64(x0) == Some(0) {
                     mem.write_u64(x0, u64::MAX);
-                    return Flow::CallGuest { pc: x2, args: vec![x1], result: 0 };
+                    return Flow::CallGuest { pc: x2, args: vec![x1], result: 0, retry_at: None };
                 }
             }
             Kind::PthreadOnce => {
                 if self.once_done.insert(x0) {
-                    return Flow::CallGuest { pc: x1, args: vec![], result: 0 };
+                    return Flow::CallGuest { pc: x1, args: vec![], result: 0, retry_at: None };
                 }
                 cpu.set_reg(0, 0);
             }
@@ -482,6 +667,51 @@ impl Hle {
             Kind::PthreadSetSpecific => {
                 self.tsd.insert(x0, x1);
                 cpu.set_reg(0, 0);
+            }
+            Kind::ObjcMsgSend => {
+                return self.msg_send(cpu, mem, x0, x1, None, stub_addr, lr);
+            }
+            Kind::ObjcMsgSendSuper2 => {
+                // x0 points to struct objc_super { receiver, current class }.
+                let (Some(receiver), Some(current)) = (mem.read_u64(x0), mem.read_u64(x0.wrapping_add(8)))
+                else {
+                    return Flow::Done(format!("objc_msgSendSuper2: bad objc_super at {x0:#x}"));
+                };
+                cpu.set_reg(0, receiver);
+                let sup = self.objc.classes.get(&current).map(|c| c.superclass);
+                return self.msg_send(cpu, mem, receiver, x1, sup, stub_addr, lr);
+            }
+            Kind::ReturnX0 => {}
+            Kind::ObjcStoreStrong => {
+                mem.write_u64(x0, x1);
+            }
+            Kind::SelRegister => {
+                let n = Objc::cstr(mem, x0).unwrap_or_default();
+                let p = self.objc.intern_sel(mem, &mut self.heap, &n);
+                cpu.set_reg(0, p);
+            }
+            Kind::ObjcGetClass => {
+                let n = Objc::cstr(mem, x0).unwrap_or_default();
+                let c = self.objc.by_name.get(&n).copied().unwrap_or(0);
+                cpu.set_reg(0, c);
+            }
+            Kind::NsClassFromString => {
+                let c = read_cfstring(mem, x0)
+                    .and_then(|n| self.objc.by_name.get(&n).copied())
+                    .unwrap_or(0);
+                cpu.set_reg(0, c);
+            }
+            Kind::NsStringFromClass => {
+                let n = self.objc.classes.get(&x0).map(|c| c.name.clone());
+                let s = match n {
+                    Some(n) => self.make_string(mem, &n),
+                    None => 0,
+                };
+                cpu.set_reg(0, s);
+            }
+            Kind::ObjectGetClass => {
+                let c = self.objc.class_of(mem, x0).unwrap_or(0);
+                cpu.set_reg(0, c);
             }
             Kind::Unknown => {
                 if self.seen.insert(id) {
@@ -540,7 +770,7 @@ impl Machine {
                     match self.hle.handle(&mut self.cpu, &mut self.mem, n) {
                         Flow::Continue => {}
                         Flow::Done(msg) => return CallEnd::Stopped(msg),
-                        Flow::CallGuest { pc: f, args: a, result } => {
+                        Flow::CallGuest { pc: f, args: a, result, retry_at } => {
                             // Park the interrupted call's registers, run the
                             // callee on the stack below it, then restore.
                             let mut saved = Context64::default();
@@ -553,7 +783,10 @@ impl Machine {
                             if let CallEnd::Stopped(msg) = end {
                                 return CallEnd::Stopped(msg);
                             }
-                            self.cpu.set_reg(0, result);
+                            match retry_at {
+                                Some(at) => self.cpu.set_pc(at),
+                                None => self.cpu.set_reg(0, result),
+                            }
                         }
                     }
                     if self.hle.calls > MAX_HLE_CALLS {
@@ -639,6 +872,65 @@ impl Machine {
         }
     }
 
+    /// Send an Objective-C message from Rust. Only methods the app itself
+    /// implements are looked up; for anything else the receiver is returned
+    /// (which is right for `init`).
+    fn send(&mut self, obj: u64, sel: &str, args: &[u64]) -> CallEnd {
+        let Some(cls) = self.hle.objc.class_of(&self.mem, obj) else {
+            return CallEnd::Stopped(format!("{obj:#x} is not an Objective-C object"));
+        };
+        let Some(imp) = self.hle.objc.find(cls, sel) else {
+            return CallEnd::Returned(obj);
+        };
+        let sel_ptr = self.hle.objc.intern_sel(&mut self.mem, &mut self.hle.heap, sel);
+        let mut a = vec![obj, sel_ptr];
+        a.extend_from_slice(args);
+        self.call(imp, &a, sel)
+    }
+
+    /// What UIApplicationMain would do first: create the app delegate and
+    /// tell it the app has launched.
+    fn launch_app(&mut self) {
+        let Some((principal, delegate)) = self.hle.objc.app_main else {
+            return;
+        };
+        let principal_name = read_cfstring(&self.mem, principal);
+        let delegate_name = read_cfstring(&self.mem, delegate);
+        echo!("[a64] UIApplicationMain(principal class {principal_name:?}, delegate class {delegate_name:?})");
+        let Some(name) = delegate_name else {
+            echo!("[a64] no delegate class name was given; stopping here");
+            return;
+        };
+        let Some(&cls) = self.hle.objc.by_name.get(&name) else {
+            echo!("[a64] the app has no class called {name}; stopping here");
+            return;
+        };
+        let mut obj = self.hle.alloc_instance(&mut self.mem, cls);
+        echo!("[a64] created the app delegate: an instance of {name} at {obj:#x}");
+        match self.send(obj, "init", &[]) {
+            CallEnd::Returned(r) => {
+                if r != 0 {
+                    obj = r;
+                }
+                echo!("[a64] -init done");
+            }
+            CallEnd::Stopped(msg) => {
+                echo!("[a64] -init stopped: {msg}");
+                self.brief_state();
+            }
+        }
+        // The UIApplication object and the launch options are nil for now.
+        match self.send(obj, "application:didFinishLaunchingWithOptions:", &[0, 0]) {
+            CallEnd::Returned(r) => {
+                echo!("[a64] application:didFinishLaunchingWithOptions: returned {r:#x}");
+            }
+            CallEnd::Stopped(msg) => {
+                echo!("[a64] application:didFinishLaunchingWithOptions: stopped: {msg}");
+                self.brief_state();
+            }
+        }
+    }
+
     /// Short version of `dump_state`, for failures we then carry on from.
     fn brief_state(&self) {
         log!("[a64]   pc = {}", self.describe(self.cpu.pc()));
@@ -667,6 +959,15 @@ impl Machine {
         );
         for (id, n) in unimpl.iter().take(150) {
             log!("[a64]   {:>8} x  {}", n, self.hle.names[*id as usize]);
+        }
+        let mut un: Vec<(&String, &u64)> = self.hle.objc.unhandled.iter().collect();
+        un.sort_by(|a, b| b.1.cmp(a.1).then_with(|| a.0.as_str().cmp(b.0.as_str())));
+        log!(
+            "[a64] {} different Objective-C messages had no implementation (answered nil). Most sent first:",
+            un.len()
+        );
+        for (k, n) in un.iter().take(250) {
+            log!("[a64]   {:>8} x  {}", n, k);
         }
     }
 }
@@ -713,6 +1014,7 @@ pub fn run(bundle: &Bundle, exe: &[u8]) -> Result<(), String> {
         stub_code.extend_from_slice(&0xD65F_03C0u32.to_le_bytes());
     }
     let trap_addr = STUB_BASE + names.len() as u64 * 8;
+    let n_imports = names.len();
 
     let image_size = (macho.last_segment_end - macho.text_base + 0xfff) & !0xfff;
     let mut mem = Mem64 {
@@ -726,13 +1028,47 @@ pub fn run(bundle: &Bundle, exe: &[u8]) -> Result<(), String> {
 
     macho.map_into(exe, &mut mem, 0)?;
     macho.apply_rebases(&mut mem, 0)?;
+
+    let mut hle = Hle {
+        names,
+        kinds,
+        heap: Heap { next: HEAP_BASE, sizes: HashMap::new() },
+        objc: Objc::default(),
+        seen: HashSet::new(),
+        counts: HashMap::new(),
+        calls: 0,
+        recent: VecDeque::new(),
+        clock: 0,
+        once_done: HashSet::new(),
+        tsd: HashMap::new(),
+        next_key: 1,
+    };
+    // Every import points at its stub, except Objective-C classes, which get
+    // placeholder class objects so the app can subclass and message them.
     for b in &macho.binds {
-        let target = STUB_BASE + index[b.symbol.as_str()] as u64 * 8;
+        let sym = b.symbol.as_str();
+        let target = if let Some(cname) = sym.strip_prefix("_OBJC_CLASS_$_") {
+            hle.objc.system_class(&mut mem, &mut hle.heap, cname).0
+        } else if let Some(cname) = sym.strip_prefix("_OBJC_METACLASS_$_") {
+            hle.objc.system_class(&mut mem, &mut hle.heap, cname).1
+        } else if sym == "___CFConstantStringClassReference" {
+            hle.objc.system_class(&mut mem, &mut hle.heap, "NSConstantString").0
+        } else {
+            STUB_BASE + index[sym] as u64 * 8
+        };
         if !mem.write_u64(b.addr, target.wrapping_add(b.addend as u64)) {
             return Err(format!("could not write bind for {} at {:#x}", b.symbol, b.addr));
         }
     }
-    echo!("[a64] mapped the image and bound {} imports to stubs", names.len());
+    echo!("[a64] mapped the image and bound {n_imports} imports");
+    hle.objc.load_image(&mem, &macho);
+    echo!(
+        "[a64] Objective-C: {} app classes, {} system class placeholders, {} selectors, {} +load methods to run",
+        hle.objc.classes.values().filter(|c| !c.is_hle && !c.is_meta).count(),
+        hle.objc.classes.values().filter(|c| c.is_hle && !c.is_meta).count(),
+        hle.objc.sels.len(),
+        hle.objc.pending_loads.len()
+    );
 
     let mut syms: Vec<(u64, String)> =
         macho.exported_symbols.iter().map(|(n, a)| (*a, n.clone())).collect();
@@ -741,20 +1077,7 @@ pub fn run(bundle: &Bundle, exe: &[u8]) -> Result<(), String> {
     let mut m = Machine {
         cpu: Cpu64::new(),
         mem,
-        hle: Hle {
-            names,
-            kinds,
-            heap_next: HEAP_BASE,
-            alloc_sizes: HashMap::new(),
-            seen: HashSet::new(),
-            counts: HashMap::new(),
-            calls: 0,
-            recent: VecDeque::new(),
-            clock: 0,
-            once_done: HashSet::new(),
-            tsd: HashMap::new(),
-            next_key: 1,
-        },
+        hle,
         trap_addr,
         text_base: macho.text_base,
         image_end: macho.text_base + image_size,
@@ -783,6 +1106,16 @@ pub fn run(bundle: &Bundle, exe: &[u8]) -> Result<(), String> {
     m.mem.write_u64(apple + 8, 0);
     let args = [1, argv, envp, apple];
 
+    // +load methods run first, like in the real runtime.
+    let loads = std::mem::take(&mut m.hle.objc.pending_loads);
+    let sel_load = m.hle.objc.intern_sel(&mut m.mem, &mut m.hle.heap, "load");
+    for (cls, imp) in loads {
+        if let CallEnd::Stopped(msg) = m.call(imp, &[cls, sel_load], "+load") {
+            echo!("[a64] +load at {} FAILED: {msg}", m.describe(imp));
+            m.brief_state();
+        }
+    }
+
     // Static initializers, then main().
     // A failing initializer is logged and skipped, so one problem doesn't hide
     // everything after it.
@@ -807,6 +1140,7 @@ pub fn run(bundle: &Bundle, exe: &[u8]) -> Result<(), String> {
     let why = failure.unwrap_or_default();
     if why.starts_with("SUCCESS") {
         echo!("[a64] {why}");
+        m.launch_app();
     } else {
         m.dump_state(&why);
     }
