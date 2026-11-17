@@ -265,6 +265,403 @@ struct Heap {
 
 impl Heap {
     fn alloc(&mut self, size: u64) -> u64 {
+        let size = size.max(1).checked_add(15).map(|s| s & !15);
+        let Some(size) = size else { return 0 };
+        let end = match self.next.checked_add(size) {
+            Some(e) if e <= HEAP_BASE + HEAP_SIZE => e,
+            _ => {
+                log!("[a64] guest heap exhausted (asked for {size:#x} bytes)");
+                return 0;
+            }
+        };
+        let p = self.next;
+        self.next = end;
+        self.sizes.insert(p, size);
+        p
+    }
+}
+
+fn rd32(mem: &Mem64, addr: u64) -> Option<u32> {
+    Some(u32::from_le_bytes(mem.read_bytes(addr, 4)?.try_into().ok()?))
+}
+
+/// (address, size) of a section of the app image, by name.
+fn section_range(macho: &MachO64, name: &str) -> Option<(u64, u64)> {
+    macho
+        .segments
+        .iter()
+        .flat_map(|s| s.sections.iter())
+        .find(|s| s.name == name)
+        .map(|s| (s.addr, s.size))
+}
+
+/// The pointers stored in a section like `__objc_classlist`.
+fn read_ptrs(mem: &Mem64, macho: &MachO64, name: &str) -> Vec<u64> {
+    match section_range(macho, name) {
+        Some((addr, size)) => (0..size / 8).filter_map(|i| mem.read_u64(addr + i * 8)).collect(),
+        None => Vec::new(),
+    }
+}
+
+/// A method list (`method_list_t`): selector name -> implementation address.
+/// Selector pointers are also remembered in `sels`, because inside one image
+/// the same selector name always has the same address.
+fn parse_method_list(mem: &Mem64, ptr: u64, sels: &mut HashMap<String, u64>) -> HashMap<String, u64> {
+    let mut out = HashMap::new();
+    if ptr == 0 {
+        return out;
+    }
+    let (Some(entsize_flags), Some(count)) = (rd32(mem, ptr), rd32(mem, ptr + 4)) else {
+        return out;
+    };
+    let entsize = (entsize_flags & 0xfffc) as u64;
+    // 24 bytes = absolute pointers (iOS up to 14). Shorter entries are the
+    // newer relative format, which this app doesn't use.
+    if entsize < 24 || count > 100_000 {
+        return out;
+    }
+    for i in 0..count as u64 {
+        let e = ptr + 8 + i * entsize;
+        let (Some(name_ptr), Some(imp)) = (mem.read_u64(e), mem.read_u64(e + 16)) else {
+            continue;
+        };
+        if let Some(bytes) = mem.read_c_bytes(name_ptr, 4096) {
+            let name = String::from_utf8_lossy(&bytes).into_owned();
+            sels.entry(name.clone()).or_insert(name_ptr);
+            out.insert(name, imp);
+        }
+    }
+    out
+}
+
+/// Text of a constant string object (`@"..."`, a `CFString` literal):
+/// { isa, flags, chars pointer, length }.
+fn read_cfstring(mem: &Mem64, addr: u64) -> Option<String> {
+    if addr == 0 {
+        return None;
+    }
+    let flags = mem.read_u64(addr + 8)?;
+    let chars = mem.read_u64(addr + 16)?;
+    let len = mem.read_u64(addr + 24)? as usize;
+    if len > (1 << 20) {
+        return None;
+    }
+    if flags & 0x10 != 0 {
+        // UTF-16
+        let raw = mem.read_bytes(chars, len * 2)?;
+        let units: Vec<u16> = raw.chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect();
+        Some(String::from_utf16_lossy(&units))
+    } else {
+        Some(String::from_utf8_lossy(mem.read_bytes(chars, len)?).into_owned())
+    }
+}
+
+/// Superclass of a system class that we create as a placeholder.
+fn hle_superclass(name: &str) -> Option<&'static str> {
+    match name {
+        "NSObject" => None,
+        "UIApplication" | "UIView" | "UIViewController" => Some("UIResponder"),
+        "UIWindow" | "UIControl" | "UILabel" | "UIImageView" | "UIScrollView"
+        | "UITableViewCell" | "UIActivityIndicatorView" | "UIAlertView" | "UIWebView" => {
+            Some("UIView")
+        }
+        "UIButton" | "UITextField" | "UISwitch" | "UISlider" => Some("UIControl"),
+        "UITextView" | "UITableView" | "UICollectionView" => Some("UIScrollView"),
+        "UITableViewController" | "UINavigationController" | "UITabBarController"
+        | "UIActivityViewController" => Some("UIViewController"),
+        "NSMutableArray" => Some("NSArray"),
+        "NSMutableDictionary" => Some("NSDictionary"),
+        "NSMutableString" | "NSConstantString" => Some("NSString"),
+        "NSMutableData" => Some("NSData"),
+        "NSMutableSet" => Some("NSSet"),
+        _ => Some("NSObject"),
+    }
+}
+
+/// Selectors our built-in NSObject answers (for `respondsToSelector:`).
+const BUILTIN_SELS: &[&str] = &[
+    "init", "self", "retain", "release", "autorelease", "class", "superclass", "isEqual:",
+    "hash", "isKindOfClass:", "isMemberOfClass:", "respondsToSelector:", "performSelector:",
+    "performSelector:withObject:", "dealloc",
+];
+
+struct ClassInfo {
+    name: String,
+    superclass: u64,
+    is_meta: bool,
+    /// A placeholder for a system class (as opposed to one from the app).
+    is_hle: bool,
+    instance_size: u64,
+    /// Selector name -> implementation address, for methods the app defines
+    /// (including those added by categories).
+    methods: HashMap<String, u64>,
+    initialized: bool,
+}
+
+#[derive(Default)]
+struct Objc {
+    /// By class_t address; metaclasses are included.
+    classes: HashMap<u64, ClassInfo>,
+    by_name: HashMap<String, u64>,
+    sels: HashMap<String, u64>,
+    sel_names: HashMap<u64, String>,
+    /// "-[Class selector]" -> how often it was sent without an implementation.
+    unhandled: HashMap<String, u64>,
+    /// +load methods to run: (class, implementation).
+    pending_loads: Vec<(u64, u64)>,
+    load_scheduled: HashSet<u64>,
+    /// (principal class name, delegate class name) strings given to
+    /// UIApplicationMain.
+    app_main: Option<(u64, u64)>,
+}
+
+impl Objc {
+    fn cstr(mem: &Mem64, addr: u64) -> Option<String> {
+        mem.read_c_bytes(addr, 4096).map(|b| String::from_utf8_lossy(&b).into_owned())
+    }
+
+    fn sel_name(&mut self, mem: &Mem64, sel: u64) -> String {
+        if let Some(n) = self.sel_names.get(&sel) {
+            return n.clone();
+        }
+        let n = Self::cstr(mem, sel).unwrap_or_default();
+        self.sel_names.insert(sel, n.clone());
+        self.sels.entry(n.clone()).or_insert(sel);
+        n
+    }
+
+    /// Address of the selector called `name`, creating it if the app never
+    /// mentions it.
+    fn intern_sel(&mut self, mem: &mut Mem64, heap: &mut Heap, name: &str) -> u64 {
+        if let Some(a) = self.sels.get(name) {
+            return *a;
+        }
+        let mut bytes = name.as_bytes().to_vec();
+        bytes.push(0);
+        let p = heap.alloc(bytes.len() as u64);
+        mem.write_slice(p, &bytes);
+        self.sels.insert(name.to_string(), p);
+        self.sel_names.insert(p, name.to_string());
+        p
+    }
+
+    /// The (class, metaclass) addresses of system class `name`, creating the
+    /// placeholder objects in guest memory the first time.
+    fn system_class(&mut self, mem: &mut Mem64, heap: &mut Heap, name: &str) -> (u64, u64) {
+        if let Some(&c) = self.by_name.get(name) {
+            return (c, mem.read_u64(c).unwrap_or(0));
+        }
+        let sup = hle_superclass(name).map(|s| self.system_class(mem, heap, s));
+        // class_t: isa, superclass, cache, vtable, data
+        let cls = heap.alloc(48);
+        let meta = heap.alloc(48);
+        mem.write_u64(cls, meta);
+        mem.write_u64(cls + 8, sup.map_or(0, |s| s.0));
+        mem.write_u64(meta, meta);
+        // The root metaclass inherits from the root class, so class methods
+        // fall back to instance methods of NSObject, as in the real runtime.
+        mem.write_u64(meta + 8, sup.map_or(cls, |s| s.1));
+        let info = |is_meta: bool, superclass: u64| ClassInfo {
+            name: name.to_string(),
+            superclass,
+            is_meta,
+            is_hle: true,
+            instance_size: 0x40,
+            methods: HashMap::new(),
+            initialized: false,
+        };
+        self.classes.insert(cls, info(false, sup.map_or(0, |s| s.0)));
+        self.classes.insert(meta, info(true, sup.map_or(cls, |s| s.1)));
+        self.by_name.insert(name.to_string(), cls);
+        (cls, meta)
+    }
+
+    /// Register a class (or metaclass) defined in the app image, and the
+    /// classes it links to inside the image.
+    fn add_app_class(&mut self, mem: &Mem64, c: u64, image: (u64, u64)) {
+        if c == 0 || self.classes.contains_key(&c) {
+            return;
+        }
+        let (Some(isa), Some(sup), Some(data)) =
+            (mem.read_u64(c), mem.read_u64(c + 8), mem.read_u64(c + 32))
+        else {
+            return;
+        };
+        let ro = data & !7;
+        let (Some(flags), Some(inst_size), Some(name_ptr), Some(methods_ptr)) = (
+            rd32(mem, ro),
+            rd32(mem, ro + 8),
+            mem.read_u64(ro + 24),
+            mem.read_u64(ro + 32),
+        ) else {
+            return;
+        };
+        let name = Self::cstr(mem, name_ptr).unwrap_or_default();
+        let methods = parse_method_list(mem, methods_ptr, &mut self.sels);
+        let is_meta = flags & 1 != 0;
+        self.classes.insert(
+            c,
+            ClassInfo {
+                name: name.clone(),
+                superclass: sup,
+                is_meta,
+                is_hle: false,
+                instance_size: inst_size as u64,
+                methods,
+                initialized: false,
+            },
+        );
+        if !is_meta {
+            self.by_name.insert(name, c);
+        }
+        let in_image = |a: u64| a >= image.0 && a < image.1;
+        if in_image(isa) {
+            self.add_app_class(mem, isa, image);
+        }
+        if sup != 0 && in_image(sup) {
+            self.add_app_class(mem, sup, image);
+        }
+    }
+
+    /// Queue `cls`'s own +load (superclasses first).
+    fn schedule_load(&mut self, mem: &Mem64, cls: u64) {
+        if !self.load_scheduled.insert(cls) {
+            return;
+        }
+        let sup = self.classes.get(&cls).map_or(0, |c| c.superclass);
+        if sup != 0 && self.classes.get(&sup).map_or(false, |c| !c.is_hle) {
+            self.schedule_load(mem, sup);
+        }
+        if let Some(meta) = mem.read_u64(cls) {
+            let imp = self.classes.get(&meta).and_then(|m| m.methods.get("load")).copied();
+            if let Some(imp) = imp {
+                self.pending_loads.push((cls, imp));
+            }
+        }
+    }
+
+    /// Read all Objective-C metadata of the app image.
+    fn load_image(&mut self, mem: &Mem64, macho: &MachO64) {
+        let image = (macho.text_base, macho.last_segment_end);
+        for p in read_ptrs(mem, macho, "__objc_selrefs") {
+            if let Some(n) = Self::cstr(mem, p) {
+                self.sels.entry(n).or_insert(p);
+            }
+        }
+        for c in read_ptrs(mem, macho, "__objc_classlist") {
+            self.add_app_class(mem, c, image);
+        }
+        // +load for non-lazy classes; must be decided before categories are
+        // merged, because a category may define its own +load as well.
+        for c in read_ptrs(mem, macho, "__objc_nlclslist") {
+            self.add_app_class(mem, c, image);
+            self.schedule_load(mem, c);
+        }
+        let non_lazy_cats: HashSet<u64> = read_ptrs(mem, macho, "__objc_nlcatlist").into_iter().collect();
+        for cat in read_ptrs(mem, macho, "__objc_catlist") {
+            // category_t: name, cls, instanceMethods, classMethods, ...
+            let (Some(cls), Some(im_ptr), Some(cm_ptr)) =
+                (mem.read_u64(cat + 8), mem.read_u64(cat + 16), mem.read_u64(cat + 24))
+            else {
+                continue;
+            };
+            let inst = parse_method_list(mem, im_ptr, &mut self.sels);
+            let class_m = parse_method_list(mem, cm_ptr, &mut self.sels);
+            let load_imp = class_m.get("load").copied();
+            let meta = mem.read_u64(cls).unwrap_or(0);
+            if let Some(ci) = self.classes.get_mut(&cls) {
+                ci.methods.extend(inst);
+            }
+            if let Some(mi) = self.classes.get_mut(&meta) {
+                mi.methods.extend(class_m);
+            }
+            if non_lazy_cats.contains(&cat) {
+                if let Some(imp) = load_imp {
+                    self.pending_loads.push((cls, imp));
+                }
+            }
+        }
+    }
+
+    /// The class of an object (for a class object: its metaclass).
+    fn class_of(&self, mem: &Mem64, obj: u64) -> Option<u64> {
+        let isa = mem.read_u64(obj)?;
+        let c = isa & 0x0000_000f_ffff_fff8; // no-op for plain isa pointers
+        if self.classes.contains_key(&c) {
+            Some(c)
+        } else {
+            None
+        }
+    }
+
+    /// Method lookup along the superclass chain. Only finds methods the app
+    /// implements.
+    fn find(&self, start: u64, sel: &str) -> Option<u64> {
+        let mut c = start;
+        for _ in 0..64 {
+            let info = self.classes.get(&c)?;
+            if let Some(&imp) = info.methods.get(sel) {
+                return Some(imp);
+            }
+            if info.superclass == 0 || info.superclass == c {
+                return None;
+            }
+            c = info.superclass;
+        }
+        None
+    }
+
+    /// The first not yet initialized class in `recv`'s superclass chain
+    /// (superclass first) that has an +initialize, with that method.
+    fn pending_initialize(&mut self, mem: &Mem64, recv: u64) -> Option<(u64, u64)> {
+        let mut chain = Vec::new();
+        let mut c = recv;
+        for _ in 0..64 {
+            chain.push(c);
+            let sup = self.classes.get(&c).map_or(0, |i| i.superclass);
+            if sup == 0 || sup == c {
+                break;
+            }
+            c = sup;
+        }
+        for &c in chain.iter().rev() {
+            let Some(info) = self.classes.get_mut(&c) else { continue };
+            if info.initialized {
+                continue;
+            }
+            info.initialized = true;
+            if info.is_hle {
+                continue;
+            }
+            let meta = mem.read_u64(c)?;
+            let imp = self.classes.get(&meta).and_then(|m| m.methods.get("initialize")).copied();
+            if let Some(imp) = imp {
+                return Some((imp, c));
+            }
+        }
+        None
+    }
+}
+
+/// All "high-level emulation" state: the imported functions and their
+/// bookkeeping.
+struct Hle {
+    names: Vec<String>,
+    kinds: Vec<Kind>,
+    heap: Heap,
+    objc: Objc,
+    seen: HashSet<u32>,
+    counts: HashMap<u32, u64>,
+    calls: u64,
+    recent: VecDeque<String>,
+    clock: u64,
+    once_done: HashSet<u64>,
+    tsd: HashMap<u64, u64>,
+    next_key: u64,
+}
+
+impl Hle {
+    fn alloc(&mut self, size: u64) -> u64 {
         self.heap.alloc(size)
     }
 
