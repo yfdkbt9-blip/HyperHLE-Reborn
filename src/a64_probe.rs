@@ -20,6 +20,7 @@
 
 use crate::bundle::Bundle;
 use crate::cpu64::{Context64, Cpu64, GuestBus, StopReason};
+use crate::fs::{Fs, GuestPath, GuestPathBuf};
 use crate::mach_o64::{GuestMemory64, MachO64};
 use std::collections::{HashMap, HashSet, VecDeque};
 
@@ -190,6 +191,15 @@ enum Kind {
     NewHandle,
     ReturnOne,
     BlockObjectAssign,
+    BlockCopy,
+    DispatchAsync,
+    DispatchAfter,
+    DispatchSync,
+    DispatchTime,
+    DispatchGroupAsync,
+    DispatchGroupNotify,
+    ObjcCopyStruct,
+    DyldImageHeader,
     /// Not implemented: logs the first call and returns 0.
     Unknown,
 }
@@ -263,9 +273,29 @@ fn classify(name: &str) -> Kind {
         | "_SCNetworkReachabilityUnscheduleFromRunLoop"
         | "_SCNetworkReachabilitySetDispatchQueue" => Kind::ReturnOne,
         "__Block_object_assign" => Kind::BlockObjectAssign,
-        "_Block_copy" | "_CFRetain" => Kind::ReturnX0,
+        "_CFRetain" => Kind::ReturnX0,
+        "_Block_copy" => Kind::BlockCopy,
         "_Block_release" | "_CFRelease" => Kind::Free,
         "_objc_sync_enter" | "_objc_sync_exit" | "___cxa_guard_abort" | "__Block_object_dispose" => Kind::ReturnZero,
+        "_dispatch_async" | "_dispatch_barrier_async" => Kind::DispatchAsync,
+        "_dispatch_after" => Kind::DispatchAfter,
+        "_dispatch_sync" | "_dispatch_barrier_sync" => Kind::DispatchSync,
+        "_dispatch_time" => Kind::DispatchTime,
+        "_dispatch_group_async" => Kind::DispatchGroupAsync,
+        "_dispatch_group_notify" => Kind::DispatchGroupNotify,
+        "_dispatch_queue_create"
+        | "_dispatch_get_global_queue"
+        | "_dispatch_group_create"
+        | "_dispatch_semaphore_create" => Kind::NewHandle,
+        "_dispatch_semaphore_wait"
+        | "_dispatch_semaphore_signal"
+        | "_dispatch_group_enter"
+        | "_dispatch_group_leave"
+        | "_dispatch_group_wait"
+        | "_dispatch_release"
+        | "_dispatch_retain" => Kind::ReturnZero,
+        "_objc_copyStruct" => Kind::ObjcCopyStruct,
+        "__dyld_get_image_header" => Kind::DyldImageHeader,
         "_objc_msgSend" => Kind::ObjcMsgSend,
         "_objc_msgSendSuper2" => Kind::ObjcMsgSendSuper2,
         "_objc_retain"
@@ -425,6 +455,10 @@ fn hle_superclass(name: &str) -> Option<&'static str> {
         "NSMutableString" | "NSConstantString" => Some("NSString"),
         "NSMutableData" => Some("NSData"),
         "NSMutableSet" => Some("NSSet"),
+        "NSUserDefaults" => Some("NSMutableDictionary"),
+        "CAEAGLLayer" => Some("CALayer"),
+        "GLKView" => Some("UIView"),
+        "GLKViewController" | "UIAlertController" => Some("UIViewController"),
         _ => Some("NSObject"),
     }
 }
@@ -791,6 +825,7 @@ enum Obj {
     /// Key/value pairs in insertion order.
     Dict(Vec<(u64, u64)>),
     Url(String),
+    Data(Vec<u8>),
     /// An object of a system class that carries no data (a singleton, a pool).
     Plain,
 }
@@ -804,6 +839,27 @@ const NS_NOT_FOUND: u64 = i64::MAX as u64;
 /// Pretend location of the app's sandbox.
 const SANDBOX: &str = "/var/mobile/Containers/Data/Application/00000000-0000-0000-0000-000000000000";
 
+/// Something the main run loop will do later.
+#[derive(Clone, Debug)]
+enum Action {
+    /// `[target selector:args...]`
+    Send { target: u64, sel: u64, args: Vec<u64> },
+    /// Call a block with these arguments.
+    Block { block: u64, args: Vec<u64> },
+}
+
+/// A timer-like entry of the run loop (NSTimer, dispatch_after, ...).
+#[derive(Clone, Debug)]
+struct Scheduled {
+    /// Virtual time (ns) at which it is due.
+    due: u64,
+    /// 0 = once, otherwise the repeat interval (ns).
+    repeat: u64,
+    action: Action,
+    /// Object that can cancel it (the NSTimer), or 0.
+    handle: u64,
+}
+
 fn fnv_hash(s: &str) -> u64 {
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;
     for b in s.bytes() {
@@ -815,7 +871,7 @@ fn fnv_hash(s: &str) -> u64 {
 
 /// All "high-level emulation" state: the imported functions and their
 /// bookkeeping.
-struct Hle {
+struct Hle<'a> {
     names: Vec<String>,
     kinds: Vec<Kind>,
     heap: Heap,
@@ -832,6 +888,23 @@ struct Hle {
     exe_name: String,
     exe_path_ptr: u64,
     seen_logs: HashSet<String>,
+    fs: &'a Fs,
+    /// Real guest path of the app bundle in the emulated file system.
+    bundle_guest: String,
+    /// Files the app wrote this session.
+    overlay: HashMap<String, Vec<u8>>,
+    /// Generic UIKit properties: (object, name) -> [X2, D0, D1, D2, D3].
+    props: HashMap<(u64, String), [u64; 5]>,
+    visible_windows: Vec<u64>,
+    /// Virtual time in nanoseconds.
+    vtime: u64,
+    scheduled: Vec<Scheduled>,
+    /// Display links: (link object, target, selector).
+    links: Vec<(u64, u64, u64)>,
+    total_calls: u64,
+    auto_seen: HashMap<String, u64>,
+    data_ptrs: HashMap<u64, u64>,
+    image_base: u64,
     seen: HashSet<u32>,
     counts: HashMap<u32, u64>,
     calls: u64,
@@ -842,7 +915,7 @@ struct Hle {
     next_key: u64,
 }
 
-impl Hle {
+impl<'a> Hle<'a> {
     fn alloc(&mut self, size: u64) -> u64 {
         self.heap.alloc(size)
     }
@@ -1076,6 +1149,7 @@ impl Hle {
         }
         match self.objs.get(&obj) {
             Some(Obj::Str(s)) | Some(Obj::Url(s)) => return s.clone(),
+            Some(Obj::Data(d)) => return format!("<{} bytes>", d.len()),
             Some(Obj::Num(n)) => {
                 return if n.float { format!("{}", n.f) } else { n.i.to_string() };
             }
@@ -1170,6 +1244,7 @@ impl Hle {
                 "NSDictionary" => Some(Obj::Dict(Vec::new())),
                 "NSNumber" => Some(Obj::Num(Num::int(0))),
                 "NSURL" => Some(Obj::Url(String::new())),
+                "NSData" => Some(Obj::Data(Vec::new())),
                 _ => None,
             };
             if let Some(o) = o {
@@ -1388,6 +1463,13 @@ impl Hle {
                 return true;
             }
         }
+        // Plain property accessors of UIKit / Core Animation objects.
+        let uikit = chain
+            .iter()
+            .any(|(n, _)| matches!(n.as_str(), "UIResponder" | "CALayer" | "CADisplayLink" | "NSTimer"));
+        if uikit && !chain[0].1 && self.auto_property(cpu, recv, sel) {
+            return true;
+        }
         false
     }
 
@@ -1460,7 +1542,9 @@ impl Hle {
                 ret!(recv)
             }
             ("NSString", false, "initWithCapacity:") => ret!(recv),
-            ("NSString", false, "UTF8String") | ("NSString", false, "cStringUsingEncoding:") => {
+            ("NSString", false, "UTF8String")
+            | ("NSString", false, "cStringUsingEncoding:")
+            | ("NSString", false, "fileSystemRepresentation") => {
                 let p = self.utf8_ptr(mem, recv);
                 ret!(p)
             }
@@ -2052,7 +2136,10 @@ impl Hle {
                     Some(e) if !e.is_empty() => format!("{p}/{file}.{e}"),
                     _ => format!("{p}/{file}"),
                 };
-                self.log_once(format!("NSBundle {sel} -> {p}"));
+                if !self.file_exists(&p).0 {
+                    self.log_once(format!("NSBundle {sel}: no such file {p}"));
+                    ret!(0)
+                }
                 let o = self.new_string(mem, &p);
                 ret!(o)
             }
@@ -2081,11 +2168,12 @@ impl Hle {
             }
             ("NSFileManager", false, "fileExistsAtPath:") | ("NSFileManager", false, "fileExistsAtPath:isDirectory:") => {
                 let path = self.str_of(mem, a2).unwrap_or_default();
-                self.log_once(format!("NSFileManager {sel} {path}"));
+                let (exists, is_dir) = self.file_exists(&path);
+                self.log_once(format!("NSFileManager {sel} {path} -> {exists}"));
                 if sel.ends_with("isDirectory:") && a3 != 0 {
-                    mem.write_slice(a3, &[0u8]);
+                    mem.write_slice(a3, &[is_dir as u8]);
                 }
-                ret!(path.starts_with(&self.bundle_path) as u64)
+                ret!(exists as u64)
             }
             ("NSFileManager", false, "createDirectoryAtPath:withIntermediateDirectories:attributes:error:")
             | ("NSFileManager", false, "removeItemAtPath:error:")
@@ -2098,8 +2186,9 @@ impl Hle {
             }
             ("NSFileManager", false, "isReadableFileAtPath:") | ("NSFileManager", false, "isWritableFileAtPath:") => {
                 let path = self.str_of(mem, a2).unwrap_or_default();
-                self.log_once(format!("NSFileManager {sel} {path}"));
-                ret!(1)
+                let exists = self.file_exists(&path).0;
+                self.log_once(format!("NSFileManager {sel} {path} -> {exists}"));
+                ret!(exists as u64)
             }
             ("NSFileManager", false, "contentsOfDirectoryAtPath:error:") => {
                 let o = self.new_obj(mem, "NSArray", Obj::Array(Vec::new()));
@@ -2193,7 +2282,6 @@ impl Hle {
             }
 
             // ----- UIKit objects: just enough to be created -----
-            ("UIView", false, "initWithFrame:") | ("UIViewController", false, "init") | ("UIViewController", false, "initWithNibName:bundle:") => ret!(recv),
 
             // ----- notifications, process, pools, threads -----
             ("NSNotificationCenter", true, "defaultCenter") => {
@@ -2256,9 +2344,421 @@ impl Hle {
             }
             ("NSThread", false, "isMainThread") => ret!(1),
             ("NSThread", false, "setName:") | ("NSThread", false, "setStackSize:") | ("NSThread", false, "setThreadPriority:") => return true,
+            // ----- NSString extras -----
+            ("NSString", false, "compare:")
+            | ("NSString", false, "compare:options:")
+            | ("NSString", false, "caseInsensitiveCompare:")
+            | ("NSString", false, "localizedCompare:")
+            | ("NSString", false, "localizedCaseInsensitiveCompare:") => {
+                let (x, y) = (self.str_of(mem, recv).unwrap_or_default(), self.str_of(mem, a2).unwrap_or_default());
+                let ci = sel.contains("aseInsensitive") || (sel == "compare:options:" && a3 & 1 != 0);
+                let (x, y) = if ci { (x.to_lowercase(), y.to_lowercase()) } else { (x, y) };
+                let r: i64 = match x.cmp(&y) {
+                    std::cmp::Ordering::Less => -1,
+                    std::cmp::Ordering::Equal => 0,
+                    std::cmp::Ordering::Greater => 1,
+                };
+                ret!(r as u64)
+            }
+            ("NSString", true, "stringWithContentsOfFile:encoding:error:") => {
+                let path = self.str_of(mem, a2).unwrap_or_default();
+                match self.read_file(&path) {
+                    Some(d) => {
+                        let o = self.new_string(mem, &String::from_utf8_lossy(&d));
+                        ret!(o)
+                    }
+                    None => ret!(0),
+                }
+            }
+            ("NSURL", false, "setResourceValue:forKey:error:") => ret!(1),
+            ("NSURL", false, "getResourceValue:forKey:error:") => ret!(0),
+
+            // ----- NSData -----
+            ("NSData", true, "data") => {
+                let c = self.class_name(recv);
+                let o = self.new_obj(mem, &c, Obj::Data(Vec::new()));
+                ret!(o)
+            }
+            ("NSData", true, "dataWithContentsOfFile:")
+            | ("NSData", true, "dataWithContentsOfFile:options:error:")
+            | ("NSData", true, "dataWithContentsOfURL:") => {
+                let path = self.str_of(mem, a2).unwrap_or_default();
+                match self.read_file(&path) {
+                    Some(d) => {
+                        let c = self.class_name(recv);
+                        let o = self.new_obj(mem, &c, Obj::Data(d));
+                        ret!(o)
+                    }
+                    None => {
+                        self.log_once(format!("NSData: no such file {path}"));
+                        ret!(0)
+                    }
+                }
+            }
+            ("NSData", false, "initWithContentsOfFile:") => {
+                let path = self.str_of(mem, a2).unwrap_or_default();
+                match self.read_file(&path) {
+                    Some(d) => {
+                        self.objs.insert(recv, Obj::Data(d));
+                        ret!(recv)
+                    }
+                    None => ret!(0),
+                }
+            }
+            ("NSData", true, "dataWithBytes:length:") => {
+                let n = (a3 as usize).min(0x400_0000);
+                let d = mem.read_bytes(a2, n).map(|s| s.to_vec()).unwrap_or_default();
+                let c = self.class_name(recv);
+                let o = self.new_obj(mem, &c, Obj::Data(d));
+                ret!(o)
+            }
+            ("NSData", false, "initWithBytes:length:") => {
+                let n = (a3 as usize).min(0x400_0000);
+                let d = mem.read_bytes(a2, n).map(|s| s.to_vec()).unwrap_or_default();
+                self.objs.insert(recv, Obj::Data(d));
+                ret!(recv)
+            }
+            ("NSData", false, "length") => {
+                let n = match self.objs.get(&recv) {
+                    Some(Obj::Data(d)) => d.len(),
+                    _ => 0,
+                };
+                ret!(n as u64)
+            }
+            ("NSData", false, "bytes") => {
+                if let Some(p) = self.data_ptrs.get(&recv) {
+                    ret!(*p)
+                }
+                let d = match self.objs.get(&recv) {
+                    Some(Obj::Data(d)) => d.clone(),
+                    _ => Vec::new(),
+                };
+                let p = self.heap.alloc(d.len() as u64 + 1);
+                mem.write_slice(p, &d);
+                self.data_ptrs.insert(recv, p);
+                ret!(p)
+            }
+            ("NSData", false, "getBytes:length:") => {
+                if let Some(Obj::Data(d)) = self.objs.get(&recv) {
+                    let n = (a3 as usize).min(d.len());
+                    let chunk = d[..n].to_vec();
+                    mem.write_slice(a2, &chunk);
+                }
+                return true;
+            }
+            ("NSData", false, "writeToFile:atomically:") => {
+                let path = self.str_of(mem, a2).unwrap_or_default();
+                if let Some(Obj::Data(d)) = self.objs.get(&recv) {
+                    let d = d.clone();
+                    self.overlay.insert(path, d);
+                }
+                ret!(1)
+            }
+
+            // ----- UIKit: windows, controllers, views -----
+            ("UIApplication", true, "sharedApplication") => {
+                let o = self.singleton(mem, "UIApplication", "UIApplication", Obj::Plain);
+                ret!(o)
+            }
+            ("UIApplication", false, "applicationState") => ret!(0),
+            ("UIApplication", false, "statusBarOrientation") => ret!(3),
+            ("UIApplication", false, "canOpenURL:") => ret!(0),
+            ("UIWindow", false, "makeKeyAndVisible") => {
+                self.visible_windows.push(recv);
+                let app = self.singleton(mem, "UIApplication", "UIApplication", Obj::Plain);
+                self.set_prop(app, "keyWindow", recv);
+                return true;
+            }
+            ("UIView", false, "initWithFrame:") => {
+                let vals = [0, cpu.vec(0) as u64, cpu.vec(1) as u64, cpu.vec(2) as u64, cpu.vec(3) as u64];
+                self.props.insert((recv, "frame".to_string()), vals);
+                ret!(recv)
+            }
+            ("UIView", false, "layer") => {
+                let mut l = self.prop(recv, "layer");
+                if l == 0 {
+                    // A view whose class overrides +layerClass wants a
+                    // special layer (OpenGL ES drawing).
+                    let meta = mem.read_u64(mem.read_u64(recv).unwrap_or(0) & 0x0000_000f_ffff_fff8).unwrap_or(0);
+                    let wants_gl = self.objc.find(meta, "layerClass").is_some();
+                    l = self.new_obj(mem, if wants_gl { "CAEAGLLayer" } else { "CALayer" }, Obj::Plain);
+                    self.set_prop(recv, "layer", l);
+                }
+                ret!(l)
+            }
+            ("UIView", false, "addSubview:")
+            | ("UIView", false, "removeFromSuperview")
+            | ("UIView", false, "setNeedsLayout")
+            | ("UIView", false, "setNeedsDisplay")
+            | ("UIView", false, "layoutIfNeeded")
+            | ("UIView", false, "bringSubviewToFront:")
+            | ("UIView", false, "sendSubviewToBack:")
+            | ("UIView", false, "insertSubview:atIndex:") => return true,
+            ("UIViewController", false, "init") | ("UIViewController", false, "initWithNibName:bundle:") => ret!(recv),
+            ("UIViewController", false, "view") => {
+                let mut v = self.prop(recv, "view");
+                if v == 0 {
+                    v = self.default_view(mem);
+                    self.set_prop(recv, "view", v);
+                }
+                ret!(v)
+            }
+            ("UIViewController", false, "loadView")
+            | ("UIViewController", false, "viewDidLoad")
+            | ("UIViewController", false, "viewWillAppear:")
+            | ("UIViewController", false, "viewDidAppear:")
+            | ("UIViewController", false, "viewWillDisappear:")
+            | ("UIViewController", false, "viewDidDisappear:")
+            | ("UIViewController", false, "viewWillLayoutSubviews")
+            | ("UIViewController", false, "viewDidLayoutSubviews")
+            | ("UIViewController", false, "didReceiveMemoryWarning") => return true,
+
+            // ----- run loop: timers, display links, delayed calls -----
+            ("CADisplayLink", true, "displayLinkWithTarget:selector:") => {
+                let l = self.new_obj(mem, "CADisplayLink", Obj::Plain);
+                self.set_prop(l, "target", a2);
+                self.set_prop(l, "selector", a3);
+                ret!(l)
+            }
+            ("CADisplayLink", false, "addToRunLoop:forMode:") => {
+                let (t, s) = (self.prop(recv, "target"), self.prop(recv, "selector"));
+                if !self.links.iter().any(|l| l.0 == recv) {
+                    self.links.push((recv, t, s));
+                }
+                return true;
+            }
+            ("CADisplayLink", false, "invalidate") => {
+                self.links.retain(|l| l.0 != recv);
+                return true;
+            }
+            ("CADisplayLink", false, "timestamp") => {
+                cpu.set_f64(0, self.vtime as f64 / 1e9);
+                return true;
+            }
+            ("CADisplayLink", false, "duration") => {
+                cpu.set_f64(0, 1.0 / 60.0);
+                return true;
+            }
+            ("NSTimer", true, "scheduledTimerWithTimeInterval:target:selector:userInfo:repeats:")
+            | ("NSTimer", true, "timerWithTimeInterval:target:selector:userInfo:repeats:") => {
+                let interval = cpu.f64(0);
+                let repeats = cpu.reg(5) as u8 != 0;
+                let t = self.new_obj(mem, "NSTimer", Obj::Plain);
+                self.set_prop(t, "target", a2);
+                self.set_prop(t, "selector", a3);
+                self.set_prop(t, "userInfo", a4);
+                self.set_prop(t, "interval", interval.to_bits());
+                self.set_prop(t, "repeats", repeats as u64);
+                if sel.starts_with("scheduled") {
+                    self.schedule_timer(t);
+                }
+                ret!(t)
+            }
+            ("NSTimer", true, "scheduledTimerWithTimeInterval:repeats:block:") => {
+                let interval = cpu.f64(0);
+                let repeats = a2 as u8 != 0;
+                let b = self.copy_block(mem, a3);
+                let t = self.new_obj(mem, "NSTimer", Obj::Plain);
+                let ns = (interval.max(0.0) * 1e9) as u64;
+                let repeat = if repeats { ns.max(1_000_000) } else { 0 };
+                let due = self.vtime + ns;
+                self.schedule(due, repeat, Action::Block { block: b, args: vec![t] }, t);
+                ret!(t)
+            }
+            ("NSTimer", false, "invalidate") => {
+                self.scheduled.retain(|s| s.handle != recv);
+                return true;
+            }
+            ("NSRunLoop", true, "currentRunLoop") | ("NSRunLoop", true, "mainRunLoop") => {
+                let o = self.singleton(mem, "NSRunLoop", "NSRunLoop", Obj::Plain);
+                ret!(o)
+            }
+            ("NSRunLoop", false, "addTimer:forMode:") => {
+                self.schedule_timer(a2);
+                return true;
+            }
+            ("NSRunLoop", false, "run")
+            | ("NSRunLoop", false, "runUntilDate:")
+            | ("NSRunLoop", false, "runMode:beforeDate:")
+            | ("NSRunLoop", false, "addPort:forMode:") => return true,
+            ("NSObject", false, "performSelector:withObject:afterDelay:") => {
+                let ns = (cpu.f64(0).max(0.0) * 1e9) as u64;
+                let due = self.vtime + ns;
+                self.schedule(due, 0, Action::Send { target: recv, sel: a2, args: vec![a3] }, 0);
+                return true;
+            }
+            ("NSObject", false, "performSelectorOnMainThread:withObject:waitUntilDone:") => {
+                let due = self.vtime;
+                self.schedule(due, 0, Action::Send { target: recv, sel: a2, args: vec![a3] }, 0);
+                return true;
+            }
             _ => return false,
         }
         true
+    }
+
+    // ----- files -----
+
+    /// Our fake guest-visible path -> a path in the emulated file system.
+    fn real_path(&self, p: &str) -> Option<String> {
+        if let Some(rest) = p.strip_prefix(self.bundle_path.as_str()) {
+            Some(format!("{}/{}", self.bundle_guest.trim_end_matches('/'), rest.trim_start_matches('/')))
+        } else if let Some(rest) = p.strip_prefix(SANDBOX) {
+            Some(format!(
+                "{}/{}",
+                self.fs.home_directory().as_str().trim_end_matches('/'),
+                rest.trim_start_matches('/')
+            ))
+        } else {
+            None
+        }
+    }
+
+    /// (exists, is a directory)
+    fn file_exists(&self, p: &str) -> (bool, bool) {
+        if self.overlay.contains_key(p) {
+            return (true, false);
+        }
+        match self.real_path(p) {
+            Some(r) => {
+                let gp = GuestPath::new(&r);
+                (self.fs.exists(gp), self.fs.is_dir(gp))
+            }
+            None => (false, false),
+        }
+    }
+
+    /// File contents; files the app wrote this session shadow the real ones.
+    fn read_file(&self, p: &str) -> Option<Vec<u8>> {
+        if let Some(d) = self.overlay.get(p) {
+            return Some(d.clone());
+        }
+        let r = self.real_path(p)?;
+        self.fs.read(GuestPathBuf::from(r)).ok()
+    }
+
+    // ----- generic UIKit properties -----
+
+    fn prop(&self, obj: u64, key: &str) -> u64 {
+        self.props.get(&(obj, key.to_string())).map_or(0, |p| p[0])
+    }
+
+    fn set_prop(&mut self, obj: u64, key: &str, v: u64) {
+        self.props.insert((obj, key.to_string()), [v, 0, 0, 0, 0]);
+    }
+
+    /// `setFoo:` stores its argument (X2 and D0-D3, so objects, BOOLs, numbers
+    /// and CGRects all survive) under "foo"; `foo` / `isFoo` returns it. This
+    /// covers the many plain property accessors of UIKit classes.
+    fn auto_property(&mut self, cpu: &mut Cpu64, recv: u64, sel: &str) -> bool {
+        let colons = sel.matches(':').count();
+        let lower_first = |s: &str| -> String {
+            let mut c = s.chars();
+            match c.next() {
+                Some(f) => f.to_lowercase().collect::<String>() + c.as_str(),
+                None => String::new(),
+            }
+        };
+        let is_setter = colons == 1
+            && sel.ends_with(':')
+            && sel.starts_with("set")
+            && sel.len() > 4
+            && sel.chars().nth(3).map_or(false, |c| c.is_uppercase());
+        if is_setter {
+            let key = lower_first(&sel[3..sel.len() - 1]);
+            let vals = [
+                cpu.reg(2),
+                cpu.vec(0) as u64,
+                cpu.vec(1) as u64,
+                cpu.vec(2) as u64,
+                cpu.vec(3) as u64,
+            ];
+            self.props.insert((recv, key), vals);
+            *self.auto_seen.entry(sel.to_string()).or_insert(0) += 1;
+            return true;
+        }
+        if colons == 0 {
+            let key = if sel.starts_with("is") && sel.chars().nth(2).map_or(false, |c| c.is_uppercase()) {
+                lower_first(&sel[2..])
+            } else {
+                sel.to_string()
+            };
+            if let Some(v) = self.props.get(&(recv, key.clone())).copied() {
+                cpu.set_reg(0, v[0]);
+                for i in 0..4 {
+                    cpu.set_vec(i, v[i + 1] as u128);
+                }
+                *self.auto_seen.entry(sel.to_string()).or_insert(0) += 1;
+                return true;
+            }
+            if key == "bounds" {
+                if let Some(f) = self.props.get(&(recv, "frame".to_string())).copied() {
+                    cpu.set_reg(0, 0);
+                    cpu.set_vec(0, 0);
+                    cpu.set_vec(1, 0);
+                    cpu.set_vec(2, f[3] as u128);
+                    cpu.set_vec(3, f[4] as u128);
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    /// A plain full-screen UIView.
+    fn default_view(&mut self, mem: &mut Mem64) -> u64 {
+        let (cls, _) = self.objc.system_class(mem, &mut self.heap, "UIView");
+        let v = self.alloc_instance(mem, cls);
+        self.props.insert(
+            (v, "frame".to_string()),
+            [0, 0, 0, SCREEN_W.to_bits(), SCREEN_H.to_bits()],
+        );
+        v
+    }
+
+    // ----- blocks and the run loop -----
+
+    /// `Block_copy`: stack blocks are copied to the heap so they outlive
+    /// the function that made them. (Helpers for captured objects are not run.)
+    fn copy_block(&mut self, mem: &mut Mem64, block: u64) -> u64 {
+        if block == 0 {
+            return 0;
+        }
+        const NEEDS_FREE: u32 = 1 << 24;
+        const IS_GLOBAL: u32 = 1 << 28;
+        let flags = rd32(mem, block.wrapping_add(8)).unwrap_or(0);
+        if flags & (NEEDS_FREE | IS_GLOBAL) != 0 {
+            return block;
+        }
+        // Block layout: isa, flags, reserved, invoke, descriptor{reserved, size}.
+        let size = mem
+            .read_u64(block.wrapping_add(24))
+            .and_then(|d| mem.read_u64(d.wrapping_add(8)))
+            .unwrap_or(0);
+        if size < 32 || size > 0x10_0000 {
+            return block;
+        }
+        let Some(data) = mem.read_bytes(block, size as usize).map(|s| s.to_vec()) else {
+            return block;
+        };
+        let p = self.heap.alloc(size);
+        mem.write_slice(p, &data);
+        mem.write_slice(p.wrapping_add(8), &(flags | NEEDS_FREE).to_le_bytes());
+        p
+    }
+
+    fn schedule(&mut self, due: u64, repeat: u64, action: Action, handle: u64) {
+        self.scheduled.push(Scheduled { due, repeat, action, handle });
+    }
+
+    /// Start an NSTimer that was created with its properties filled in.
+    fn schedule_timer(&mut self, t: u64) {
+        let interval = f64::from_bits(self.prop(t, "interval"));
+        let ns = (interval.max(0.0) * 1e9) as u64;
+        let repeat = if self.prop(t, "repeats") != 0 { ns.max(1_000_000) } else { 0 };
+        let (target, sel) = (self.prop(t, "target"), self.prop(t, "selector"));
+        let due = self.vtime + ns;
+        self.schedule(due, repeat, Action::Send { target, sel, args: vec![t] }, t);
     }
 
     fn handle(&mut self, cpu: &mut Cpu64, mem: &mut Mem64, id: u32) -> Flow {
@@ -2266,6 +2766,7 @@ impl Hle {
             return Flow::Done(format!("svc #{id} does not match any stub"));
         };
         self.calls += 1;
+        self.total_calls += 1;
         *self.counts.entry(id).or_insert(0) += 1;
         let lr = cpu.lr();
         let stub_addr = STUB_BASE + id as u64 * 8;
@@ -2640,6 +3141,49 @@ impl Hle {
             Kind::BlockObjectAssign => {
                 mem.write_u64(x0, x1);
             }
+            Kind::BlockCopy => {
+                let p = self.copy_block(mem, x0);
+                cpu.set_reg(0, p);
+            }
+            Kind::DispatchAsync => {
+                let b = self.copy_block(mem, x1);
+                let at = self.vtime;
+                self.schedule(at, 0, Action::Block { block: b, args: vec![] }, 0);
+            }
+            Kind::DispatchAfter => {
+                let b = self.copy_block(mem, x2);
+                let at = x0.max(self.vtime);
+                self.schedule(at, 0, Action::Block { block: b, args: vec![] }, 0);
+            }
+            Kind::DispatchGroupAsync | Kind::DispatchGroupNotify => {
+                let b = self.copy_block(mem, x2);
+                let at = self.vtime;
+                self.schedule(at, 0, Action::Block { block: b, args: vec![] }, 0);
+            }
+            Kind::DispatchSync => match mem.read_u64(x1.wrapping_add(16)) {
+                Some(invoke) if invoke != 0 => {
+                    return Flow::CallGuest { pc: invoke, args: vec![x1], result: 0, retry_at: None }
+                }
+                _ => return Flow::Done(format!("dispatch_sync: bad block {x1:#x}")),
+            },
+            Kind::DispatchTime => {
+                let base = if x0 == 0 { self.vtime } else { x0 };
+                let r = if x0 == u64::MAX { u64::MAX } else { (base as i64).wrapping_add(x1 as i64) as u64 };
+                cpu.set_reg(0, r);
+            }
+            Kind::ObjcCopyStruct => {
+                // (dest, src, size, atomic, hasStrong)
+                let n = x2 as usize;
+                if n <= 0x10_0000 {
+                    if let Some(d) = mem.read_bytes(x1, n).map(|s| s.to_vec()) {
+                        mem.write_slice(x0, &d);
+                    }
+                }
+            }
+            Kind::DyldImageHeader => {
+                let h = if x0 == 0 { self.image_base } else { 0 };
+                cpu.set_reg(0, h);
+            }
             Kind::Unknown => {
                 if self.seen.insert(id) {
                     log!("[a64] first call to unimplemented {name} (from {lr:#x}); returning 0");
@@ -2659,10 +3203,10 @@ enum CallEnd {
     Stopped(String),
 }
 
-struct Machine {
+struct Machine<'a> {
     cpu: Cpu64,
     mem: Mem64,
-    hle: Hle,
+    hle: Hle<'a>,
     trap_addr: u64,
     text_base: u64,
     image_end: u64,
@@ -2670,7 +3214,7 @@ struct Machine {
     syms: Vec<(u64, String)>,
 }
 
-impl Machine {
+impl<'a> Machine<'a> {
     /// Call guest function `pc` from the top level and run until it returns.
     fn call(&mut self, pc: u64, args: &[u64], what: &str) -> CallEnd {
         self.run_guest(pc, args, STACK_TOP - 0x800, what)
@@ -2832,7 +3376,9 @@ impl Machine {
             echo!("[a64] the app has no class called {name}; stopping here");
             return;
         };
+        let app = self.hle.singleton(&mut self.mem, "UIApplication", "UIApplication", Obj::Plain);
         let mut obj = self.hle.alloc_instance(&mut self.mem, cls);
+        self.hle.set_prop(app, "delegate", obj);
         echo!("[a64] created the app delegate: an instance of {name} at {obj:#x}");
         match self.send(obj, "init", &[]) {
             CallEnd::Returned(r) => {
@@ -2846,9 +3392,9 @@ impl Machine {
                 self.brief_state();
             }
         }
-        // The UIApplication object and the launch options are nil for now.
+        // The launch options are nil for now.
         self.hle.calls = 0;
-        match self.send(obj, "application:didFinishLaunchingWithOptions:", &[0, 0]) {
+        match self.send(obj, "application:didFinishLaunchingWithOptions:", &[app, 0]) {
             CallEnd::Returned(r) => {
                 echo!("[a64] application:didFinishLaunchingWithOptions: returned {r:#x}");
             }
@@ -2878,6 +3424,113 @@ impl Machine {
                 }
             }
         }
+        self.show_windows();
+        self.run_loop(300);
+    }
+
+    /// Run one entry of the run loop.
+    fn exec_action(&mut self, action: Action) -> Result<(), String> {
+        match action {
+            Action::Send { target, sel, args } => {
+                let name = self.hle.objc.sel_name(&self.mem, sel);
+                match self.send(target, &name, &args) {
+                    CallEnd::Stopped(msg) => Err(format!("{name}: {msg}")),
+                    CallEnd::Returned(_) => Ok(()),
+                }
+            }
+            Action::Block { block, args } => {
+                let Some(invoke) = self.mem.read_u64(block.wrapping_add(16)) else {
+                    return Err(format!("block {block:#x} is not readable"));
+                };
+                let mut a = vec![block];
+                a.extend(args);
+                match self.call(invoke, &a, "block") {
+                    CallEnd::Stopped(msg) => Err(format!("block {block:#x}: {msg}")),
+                    CallEnd::Returned(_) => Ok(()),
+                }
+            }
+        }
+    }
+
+    /// A lifecycle message to a view controller; failures are logged and skipped.
+    fn lifecycle(&mut self, vc: u64, sel: &str, args: &[u64]) {
+        self.hle.calls = 0;
+        if let CallEnd::Stopped(msg) = self.send(vc, sel, args) {
+            echo!("[a64] {sel} FAILED: {msg}");
+            self.brief_state();
+        }
+    }
+
+    /// What UIKit does when a window with a root view controller becomes
+    /// visible: load its view, then tell it that it appears.
+    fn show_windows(&mut self) {
+        let windows = std::mem::take(&mut self.hle.visible_windows);
+        for w in windows {
+            let vc = self.hle.prop(w, "rootViewController");
+            echo!("[a64] a window became visible (root view controller {vc:#x})");
+            if vc == 0 {
+                continue;
+            }
+            if self.hle.prop(vc, "__loaded") == 0 {
+                self.hle.set_prop(vc, "__loaded", 1);
+                self.lifecycle(vc, "loadView", &[]);
+                if self.hle.prop(vc, "view") == 0 {
+                    let v = self.hle.default_view(&mut self.mem);
+                    self.hle.set_prop(vc, "view", v);
+                }
+                self.lifecycle(vc, "viewDidLoad", &[]);
+            }
+            self.lifecycle(vc, "viewWillAppear:", &[0]);
+            self.lifecycle(vc, "viewDidAppear:", &[0]);
+        }
+    }
+
+    /// A small stand-in for the main run loop: every frame (1/60 s of virtual
+    /// time) runs what is due (timers, dispatched blocks) and the display
+    /// links. Stops at the first failure.
+    fn run_loop(&mut self, frames: u32) {
+        echo!("[a64] main run loop: running up to {frames} frames");
+        for frame in 0..frames {
+            self.hle.vtime += 16_666_667;
+            let now = self.hle.vtime;
+            let mut due = Vec::new();
+            let mut later = Vec::new();
+            for s in std::mem::take(&mut self.hle.scheduled) {
+                if s.due <= now {
+                    due.push(s);
+                } else {
+                    later.push(s);
+                }
+            }
+            self.hle.scheduled = later;
+            due.sort_by_key(|s| s.due);
+            for s in due {
+                if s.repeat > 0 {
+                    let mut again = s.clone();
+                    again.due = now + s.repeat;
+                    self.hle.scheduled.push(again);
+                }
+                self.hle.calls = 0;
+                if let Err(msg) = self.exec_action(s.action) {
+                    echo!("[a64] the run loop stopped in frame {frame}: {msg}");
+                    self.brief_state();
+                    return;
+                }
+            }
+            for (link, target, sel) in self.hle.links.clone() {
+                self.hle.calls = 0;
+                let action = Action::Send { target, sel, args: vec![link] };
+                if let Err(msg) = self.exec_action(action) {
+                    echo!("[a64] the run loop stopped in frame {frame} (display link): {msg}");
+                    self.brief_state();
+                    return;
+                }
+            }
+            if !self.hle.visible_windows.is_empty() {
+                self.show_windows();
+            }
+        }
+        echo!("[a64] the run loop ran all {frames} frames without a failure");
     }
 
     /// Short version of `dump_state`, for failures we then carry on from.
@@ -2895,7 +3548,7 @@ impl Machine {
         called.sort_by(|a, b| b.1.cmp(&a.1));
         log!(
             "[a64] {} imported-function calls in total, {} different functions",
-            self.hle.calls,
+            self.hle.total_calls,
             called.len()
         );
         let unimpl: Vec<&(u32, u64)> = called
@@ -2918,11 +3571,17 @@ impl Machine {
         for (k, n) in un.iter().take(250) {
             log!("[a64]   {:>8} x  {}", n, k);
         }
+        let mut auto: Vec<(&String, &u64)> = self.hle.auto_seen.iter().collect();
+        auto.sort_by(|a, b| b.1.cmp(a.1).then_with(|| a.0.as_str().cmp(b.0.as_str())));
+        log!("[a64] {} UIKit property accessors were handled generically (stored and returned as set):", auto.len());
+        for (k, n) in auto.iter().take(150) {
+            log!("[a64]   {:>8} x  {}", n, k);
+        }
     }
 }
 
 /// Entry point, called from `main` for 64-bit-only apps.
-pub fn run(bundle: &Bundle, exe: &[u8]) -> Result<(), String> {
+pub fn run(bundle: &Bundle, fs: &Fs, exe: &[u8]) -> Result<(), String> {
     let exe_path = bundle.executable_path();
     let name = exe_path.file_name().unwrap_or("executable").to_string();
     echo!("[a64] === experimental 64-bit probe: {name} ===");
@@ -2993,6 +3652,18 @@ pub fn run(bundle: &Bundle, exe: &[u8]) -> Result<(), String> {
         exe_name: name.clone(),
         exe_path_ptr: 0,
         seen_logs: HashSet::new(),
+        fs,
+        bundle_guest: bundle.bundle_path().as_str().to_string(),
+        overlay: HashMap::new(),
+        props: HashMap::new(),
+        visible_windows: Vec::new(),
+        vtime: 0,
+        scheduled: Vec::new(),
+        links: Vec::new(),
+        total_calls: 0,
+        auto_seen: HashMap::new(),
+        data_ptrs: HashMap::new(),
+        image_base: macho.text_base,
         seen: HashSet::new(),
         counts: HashMap::new(),
         calls: 0,
