@@ -206,6 +206,12 @@ enum Kind {
     Gl,
     Dlsym,
     ObjcStoreWeak,
+    NsTemporaryDirectory,
+    Snprintf,
+    Strnlen,
+    CfStringCreate,
+    CfDictionaryCreate,
+    Socketpair,
     Vsnprintf,
     SecItemNotFound,
     /// Not implemented: logs the first call and returns 0.
@@ -236,6 +242,12 @@ fn classify(name: &str) -> Kind {
         | "_pthread_rwlock_wrlock" | "_pthread_rwlock_unlock" => Kind::ReturnZero,
         "_dlsym" => Kind::Dlsym,
         "_objc_storeWeak" => Kind::ObjcStoreWeak,
+        "_NSTemporaryDirectory" => Kind::NsTemporaryDirectory,
+        "_snprintf" => Kind::Snprintf,
+        "_strnlen" => Kind::Strnlen,
+        "_CFStringCreateWithCString" => Kind::CfStringCreate,
+        "_CFDictionaryCreate" => Kind::CfDictionaryCreate,
+        "_socketpair" => Kind::Socketpair,
         "_vsnprintf" => Kind::Vsnprintf,
         "_SecItemCopyMatching" => Kind::SecItemNotFound,
         "_strncpy" | "___strncpy_chk" => Kind::Strncpy,
@@ -3901,6 +3913,54 @@ impl<'a> Hle<'a> {
             Kind::DyldImageHeader => {
                 let h = if x0 == 0 { self.image_base } else { 0 };
                 cpu.set_reg(0, h);
+            }
+            Kind::NsTemporaryDirectory => {
+                let s = format!("{SANDBOX}/tmp/");
+                let o = self.new_string(mem, &s);
+                cpu.set_reg(0, o);
+            }
+            Kind::Snprintf => {
+                // snprintf(buf, size, fmt, ...): the variadic arguments are on the stack.
+                let fmt = Objc::cstr(mem, x2).unwrap_or_default();
+                let text = self.ns_format(mem, &fmt, cpu.sp());
+                let bytes = text.as_bytes();
+                if x0 != 0 && x1 > 0 {
+                    let n = bytes.len().min(x1 as usize - 1);
+                    let mut out = bytes[..n].to_vec();
+                    out.push(0);
+                    mem.write_slice(x0, &out);
+                }
+                cpu.set_reg(0, bytes.len() as u64);
+            }
+            Kind::Strnlen => {
+                let n = mem.read_c_bytes(x0, x1.min(1 << 24) as usize).map_or(0, |b| b.len());
+                cpu.set_reg(0, n as u64);
+            }
+            Kind::CfStringCreate => {
+                // CFStringCreateWithCString(allocator, cstr, encoding)
+                let text = Objc::cstr(mem, x1).unwrap_or_default();
+                let o = self.new_string(mem, &text);
+                cpu.set_reg(0, o);
+            }
+            Kind::CfDictionaryCreate => {
+                // CFDictionaryCreate(allocator, keys[], values[], count, ...)
+                let d = self.new_obj(mem, "NSDictionary", Obj::Dict(Vec::new()));
+                for i in 0..cpu.reg(3).min(4096) {
+                    let key = mem.read_u64(x1.wrapping_add(i * 8)).unwrap_or(0);
+                    let val = mem.read_u64(x2.wrapping_add(i * 8)).unwrap_or(0);
+                    if key != 0 {
+                        self.dict_set(mem, d, key, val);
+                    }
+                }
+                cpu.set_reg(0, d);
+            }
+            Kind::Socketpair => {
+                // socketpair(domain, type, protocol, int sv[2]): two made-up descriptors.
+                let mut b = [0u8; 8];
+                b[..4].copy_from_slice(&3u32.to_le_bytes());
+                b[4..].copy_from_slice(&4u32.to_le_bytes());
+                mem.write_slice(cpu.reg(3), &b);
+                cpu.set_reg(0, 0);
             }
             Kind::ObjcStoreWeak => {
                 // id objc_storeWeak(id *location, id obj): no zeroing weak table.
