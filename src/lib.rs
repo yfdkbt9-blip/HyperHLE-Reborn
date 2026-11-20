@@ -440,7 +440,7 @@ fn run_session<T: Iterator<Item = String>>(
     };
     // Experimental: 64-bit (arm64) apps can't run on the 32-bit engine,
     // so they go to the 64-bit probe instead.
-        if let Ok(exe) = fs.read(bundle.executable_path()) {
+            if let Ok(exe) = fs.read(bundle.executable_path()) {
         if mach_o64::is_arm64_only(&exe) {
             let mut window = window::Window::new(
                 &format!("{} ({})", bundle.display_name(), DISPLAY_NAME),
@@ -451,7 +451,7 @@ fn run_session<T: Iterator<Item = String>>(
             a64_probe::run(&bundle, &fs, &exe, &mut window, &options)?;
             return Ok(None);
         }
-        }
+            }
     let app_id = bundle.bundle_identifier();
 
     // Gangstar Rio is landscape-only. Keep UIScreen's point and pixel axes
