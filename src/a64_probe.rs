@@ -205,6 +205,9 @@ enum Kind {
     DyldImageHeader,
     Gl,
     Dlsym,
+    ObjcStoreWeak,
+    Vsnprintf,
+    SecItemNotFound,
     /// Not implemented: logs the first call and returns 0.
     Unknown,
 }
@@ -232,6 +235,9 @@ fn classify(name: &str) -> Kind {
         | "_OSSpinLockUnlock" | "_pthread_rwlock_init" | "_pthread_rwlock_rdlock"
         | "_pthread_rwlock_wrlock" | "_pthread_rwlock_unlock" => Kind::ReturnZero,
         "_dlsym" => Kind::Dlsym,
+        "_objc_storeWeak" => Kind::ObjcStoreWeak,
+        "_vsnprintf" => Kind::Vsnprintf,
+        "_SecItemCopyMatching" => Kind::SecItemNotFound,
         "_strncpy" | "___strncpy_chk" => Kind::Strncpy,
         "_strcpy" | "___strcpy_chk" => Kind::Strcpy,
         "_strcat" | "___strcat_chk" => Kind::Strcat,
@@ -280,7 +286,7 @@ fn classify(name: &str) -> Kind {
         | "_SCNetworkReachabilitySetDispatchQueue" => Kind::ReturnOne,
         "__Block_object_assign" => Kind::BlockObjectAssign,
         "_CFRetain" => Kind::ReturnX0,
-        "_Block_copy" => Kind::BlockCopy,
+        "_Block_copy" | "_objc_retainBlock" => Kind::BlockCopy,
         "_Block_release" | "_CFRelease" => Kind::Free,
         "_objc_sync_enter" | "_objc_sync_exit" | "___cxa_guard_abort" | "__Block_object_dispose" => Kind::ReturnZero,
         "_dispatch_async" | "_dispatch_barrier_async" => Kind::DispatchAsync,
@@ -1003,6 +1009,14 @@ impl<'a> Hle<'a> {
             cpu.set_reg(0, 0);
             return Flow::Continue;
         };
+        // Selector trace for crash reports (shown next to the imported calls).
+        {
+            let traced = self.class_name(cls);
+            if self.recent.len() >= 80 {
+                self.recent.pop_front();
+            }
+            self.recent.push_back(format!("  msg [{traced} {sel}] recv={recv:#x}"));
+        }
         let recv_is_class = self.objc.classes.get(&recv).map_or(false, |c| !c.is_meta);
         // First message to a class: run +initialize (superclass first), then
         // send this message again.
@@ -1866,6 +1880,19 @@ impl<'a> Hle<'a> {
                 let o = self.new_obj(mem, &c, Obj::Array(items));
                 ret!(o)
             }
+            ("NSArray", false, "initWithObjects:") => {
+                // object1, object2, ..., nil (variadic arguments are on the stack)
+                let mut items = Vec::new();
+                let mut o = a2;
+                let mut slot = 0u64;
+                while o != 0 && slot < 4000 {
+                    items.push(o);
+                    o = mem.read_u64(sp.wrapping_add(slot * 8)).unwrap_or(0);
+                    slot += 1;
+                }
+                self.objs.insert(recv, Obj::Array(items));
+                ret!(recv)
+            }
             ("NSArray", false, "initWithCapacity:") | ("NSArray", false, "init") => ret!(recv),
             ("NSArray", false, "count") => {
                 let n = match self.objs.get(&recv) {
@@ -2046,6 +2073,20 @@ impl<'a> Hle<'a> {
                     self.dict_set(mem, d, *k, *o);
                 }
                 ret!(d)
+            }
+            ("NSDictionary", false, "initWithObjects:forKeys:") => {
+                let objs = match self.objs.get(&a2) {
+                    Some(Obj::Array(v)) => v.clone(),
+                    _ => Vec::new(),
+                };
+                let keys = match self.objs.get(&a3) {
+                    Some(Obj::Array(v)) => v.clone(),
+                    _ => Vec::new(),
+                };
+                for (k, o) in keys.iter().zip(objs.iter()) {
+                    self.dict_set(mem, recv, *k, *o);
+                }
+                ret!(recv)
             }
             ("NSDictionary", false, "initWithObjects:forKeys:count:") => {
                 for i in 0..a4.min(4096) {
@@ -2542,6 +2583,28 @@ impl<'a> Hle<'a> {
             // ----- UIKit: windows, controllers, views -----
             ("UIApplication", true, "sharedApplication") => {
                 let o = self.singleton(mem, "UIApplication", "UIApplication", Obj::Plain);
+                ret!(o)
+            }
+            ("UIApplication", false, "windows") => {
+                let w = self.prop(recv, "keyWindow");
+                let items = if w != 0 { vec![w] } else { Vec::new() };
+                let o = self.new_obj(mem, "NSArray", Obj::Array(items));
+                ret!(o)
+            }
+            ("UIWindow", false, "screen") => {
+                let o = self.singleton(mem, "UIScreen", "UIScreen", Obj::Plain);
+                ret!(o)
+            }
+            ("NSError", true, "errorWithDomain:code:userInfo:") => {
+                let o = self.new_obj(mem, "NSError", Obj::Plain);
+                ret!(o)
+            }
+            ("NSUUID", true, "UUID") => {
+                let o = self.new_obj(mem, "NSUUID", Obj::Plain);
+                ret!(o)
+            }
+            ("NSCharacterSet", true, "characterSetWithCharactersInString:") => {
+                let o = self.new_obj(mem, "NSCharacterSet", Obj::Plain);
                 ret!(o)
             }
             ("UIApplication", false, "applicationState") => ret!(0),
@@ -3363,7 +3426,7 @@ impl<'a> Hle<'a> {
         let lr = cpu.lr();
         let stub_addr = STUB_BASE + id as u64 * 8;
         let name = &self.names[id as usize];
-        if self.recent.len() >= 40 {
+        if self.recent.len() >= 80 {
             self.recent.pop_front();
         }
         self.recent.push_back(format!("{name}  (called from {lr:#x})"));
@@ -3775,6 +3838,29 @@ impl<'a> Hle<'a> {
             Kind::DyldImageHeader => {
                 let h = if x0 == 0 { self.image_base } else { 0 };
                 cpu.set_reg(0, h);
+            }
+            Kind::ObjcStoreWeak => {
+                // id objc_storeWeak(id *location, id obj): no zeroing weak table.
+                mem.write_u64(x0, x1);
+                cpu.set_reg(0, x1);
+            }
+            Kind::Vsnprintf => {
+                // vsnprintf(buf, size, fmt, va_list): on Apple arm64 a va_list is a
+                // pointer to 8-byte argument slots, like our stack arguments.
+                let fmt = Objc::cstr(mem, x2).unwrap_or_default();
+                let text = self.ns_format(mem, &fmt, cpu.reg(3));
+                let bytes = text.as_bytes();
+                if x0 != 0 && x1 > 0 {
+                    let n = bytes.len().min(x1 as usize - 1);
+                    let mut out = bytes[..n].to_vec();
+                    out.push(0);
+                    mem.write_slice(x0, &out);
+                }
+                cpu.set_reg(0, bytes.len() as u64);
+            }
+            Kind::SecItemNotFound => {
+                // errSecItemNotFound: there is no keychain.
+                cpu.set_reg(0, (-25300i64) as u64);
             }
             Kind::Dlsym => {
                 // dlsym(handle, name): give out the stub of an imported symbol
@@ -4201,10 +4287,25 @@ impl<'a> Machine<'a> {
     }
 
     /// Short version of `dump_state`, for failures we then carry on from.
+    /// Hex dump of the instructions around `around` (to decode a crash site).
+    fn dump_code(&self, around: u64) {
+        let start = around.wrapping_sub(0x40) & !3;
+        if let Some(bytes) = self.mem.read_bytes(start, 0x80) {
+            for (i, row) in bytes.chunks(16).enumerate() {
+                let words: Vec<String> = row
+                    .chunks(4)
+                    .map(|w| format!("{:08x}", u32::from_le_bytes([w[0], w[1], w[2], w[3]])))
+                    .collect();
+                log!("[a64]   code {:#x}: {}", start + i as u64 * 16, words.join(" "));
+            }
+        }
+    }
+
     fn brief_state(&self) {
         log!("[a64]   pc = {}", self.describe(self.cpu.pc()));
         log!("[a64]   lr = {}", self.describe(self.cpu.lr()));
-        let skip = self.hle.recent.len().saturating_sub(12);
+        self.dump_code(self.cpu.lr());
+        let skip = self.hle.recent.len().saturating_sub(24);
         for c in self.hle.recent.iter().skip(skip) {
             log!("[a64]   recent: {c}");
         }
@@ -4281,6 +4382,11 @@ pub fn run(
             index.insert(b.symbol.as_str(), names.len() as u32);
             names.push(b.symbol.clone());
         }
+    }
+    // The app wraps __cxa_throw and finds the real one with dlsym, so the table
+    // always has a stub for it (a throw ends the running guest call).
+    if !names.iter().any(|n| n.as_str() == "___cxa_throw") {
+        names.push("___cxa_throw".to_string());
     }
     if names.len() >= TRAP_SVC as usize {
         return Err("too many imported symbols for the stub table".into());
