@@ -3778,21 +3778,54 @@ impl<'a> Hle<'a> {
             }
             Kind::Dlsym => {
                 // dlsym(handle, name): give out the stub of an imported symbol
-                // of that name. Any other symbol gets a stub that returns 0,
-                // so the app's own "symbol not found" checks (often an abort)
-                // do not fire. The names are logged to show what is missing.
+                // of that name. Any other symbol gets its own address (a
+                // zeroed heap block for data, a no-op stub for functions), so
+                // the app's "symbol not found" checks do not fire and two
+                // different names never share one address. Names are logged.
                 let sym = Objc::cstr(mem, x1).unwrap_or_default();
+                if self.seen_logs.insert("dlsym-code-dump".to_string()) {
+                    // The code around the first dlsym call site, to see what
+                    // the app does with the result.
+                    let start = lr.wrapping_sub(0x80) & !3;
+                    if let Some(bytes) = mem.read_bytes(start, 0x120).map(|b| b.to_vec()) {
+                        for (i, row) in bytes.chunks(16).enumerate() {
+                            let words: Vec<String> = row
+                                .chunks(4)
+                                .map(|w| format!("{:08x}", u32::from_le_bytes([w[0], w[1], w[2], w[3]])))
+                                .collect();
+                            log!("[a64] code {:#x}: {}", start + i as u64 * 16, words.join(" "));
+                        }
+                    }
+                }
+                let key = format!("dlsym:{sym}");
                 let want = format!("_{sym}");
                 let stub_of = |i: usize| STUB_BASE + i as u64 * 8;
-                let target = match self.names.iter().position(|n| *n == want) {
-                    Some(i) => Some((stub_of(i), true)),
-                    None => self.kinds.iter().position(|k| *k == Kind::ReturnZero).map(|i| (stub_of(i), false)),
+                let (addr, how) = if let Some(&a) = self.singletons.get(&key) {
+                    (a, "again")
+                } else if let Some(i) = self.names.iter().position(|n| *n == want) {
+                    let a = stub_of(i);
+                    self.singletons.insert(key, a);
+                    (a, "imported symbol")
+                } else if sym.contains("vtable") || sym.starts_with("OBJC_") {
+                    let a = self.alloc(64);
+                    self.singletons.insert(key, a);
+                    (a, "not imported: zeroed data block")
+                } else {
+                    let n = self.singletons.keys().filter(|k| k.starts_with("dlsym:")).count();
+                    let zeros: Vec<usize> = self
+                        .kinds
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, k)| **k == Kind::ReturnZero)
+                        .map(|(i, _)| i)
+                        .collect();
+                    let a = if zeros.is_empty() { 0 } else { stub_of(zeros[n % zeros.len()]) };
+                    self.singletons.insert(key, a);
+                    (a, "not imported: no-op stub")
                 };
-                let (addr, exact) = target.unwrap_or((0, false));
-                self.log_once(format!(
-                    "dlsym({sym:?}) -> {addr:#x} ({})",
-                    if exact { "imported symbol" } else { "not imported: no-op stub" }
-                ));
+                if how != "again" {
+                    log!("[a64] dlsym({sym:?}) -> {addr:#x} ({how})");
+                }
                 cpu.set_reg(0, addr);
             }
             Kind::Gl => {
@@ -3832,6 +3865,9 @@ struct Machine<'a> {
 impl<'a> Machine<'a> {
     /// Call guest function `pc` from the top level and run until it returns.
     fn call(&mut self, pc: u64, args: &[u64], what: &str) -> CallEnd {
+        // The loop watchdog counts per top-level call. Without this reset one
+        // runaway initializer made every later initializer and main() fail.
+        self.hle.calls = 0;
         self.run_guest(pc, args, STACK_TOP - 0x800, what)
     }
 
