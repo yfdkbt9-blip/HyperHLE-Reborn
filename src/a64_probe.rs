@@ -520,6 +520,9 @@ struct Objc {
     /// (owning class, selector) -> `Method` handle, and back.
     method_handles: HashMap<(u64, String), u64>,
     handle_info: HashMap<u64, (u64, String)>,
+    /// The app swizzled a system method: (class, selector now holding a null
+    /// implementation) -> the selector of the system implementation it stands for.
+    sys_alias: HashMap<(u64, String), String>,
 }
 
 impl Objc {
@@ -746,6 +749,23 @@ impl Objc {
         }
     }
 
+    /// The system selector behind a swizzled method whose original implementation
+    /// we do not have (see `sys_alias`).
+    fn sys_alias_of(&self, start: u64, sel: &str) -> Option<String> {
+        let mut c = start;
+        for _ in 0..64 {
+            if let Some(a) = self.sys_alias.get(&(c, sel.to_string())) {
+                return Some(a.clone());
+            }
+            let info = self.classes.get(&c)?;
+            if info.superclass == 0 || info.superclass == c {
+                return None;
+            }
+            c = info.superclass;
+        }
+        None
+    }
+
     /// Method lookup along the superclass chain. Only finds methods the app
     /// implements.
     fn find(&self, start: u64, sel: &str) -> Option<u64> {
@@ -921,6 +941,8 @@ struct Hle<'a> {
     exe_name: String,
     exe_path_ptr: u64,
     seen_logs: HashSet<String>,
+    /// String-valued Info.plist entries.
+    info_plist: HashMap<String, String>,
     fs: &'a Fs,
     window: &'a mut Window,
     options: &'a Options,
@@ -1027,8 +1049,20 @@ impl<'a> Hle<'a> {
             }
         }
         if let Some(imp) = self.objc.find(start.unwrap_or(cls), &sel) {
-            // Tail call: the method returns straight to our caller.
-            cpu.set_pc(imp);
+            if imp != 0 {
+                // Tail call: the method returns straight to our caller.
+                cpu.set_pc(imp);
+                return Flow::Continue;
+            }
+            // A swizzled method whose original is a system method: run our
+            // implementation of that one (or answer nil if there is none).
+            if let Some(orig) = self.objc.sys_alias_of(start.unwrap_or(cls), &sel) {
+                if self.hle_message(cpu, mem, recv, cls, &orig, lr) {
+                    return Flow::Continue;
+                }
+                self.log_once(format!("system original -[{} {orig}] of swizzled {sel} is not implemented", self.class_name(cls)));
+            }
+            cpu.set_reg(0, 0);
             return Flow::Continue;
         }
         if self.hle_message(cpu, mem, recv, cls, &sel, lr) {
@@ -2270,6 +2304,16 @@ impl<'a> Hle<'a> {
             }
             ("NSBundle", false, "infoDictionary") => {
                 let o = self.singleton(mem, "InfoDictionary", "NSDictionary", Obj::Dict(Vec::new()));
+                let empty = matches!(self.objs.get(&o), Some(Obj::Dict(v)) if v.is_empty());
+                if empty {
+                    let entries: Vec<(String, String)> =
+                        self.info_plist.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+                    for (k, v) in entries {
+                        let ks = self.new_string(mem, &k);
+                        let vs = self.new_string(mem, &v);
+                        self.dict_set(mem, o, ks, vs);
+                    }
+                }
                 ret!(o)
             }
             ("NSBundle", false, "objectForInfoDictionaryKey:") => {
@@ -2277,9 +2321,10 @@ impl<'a> Hle<'a> {
                 let v = match key.as_str() {
                     "CFBundleIdentifier" => self.bundle_id.clone(),
                     "CFBundleName" | "CFBundleDisplayName" | "CFBundleExecutable" => self.exe_name.clone(),
-                    _ => String::new(),
+                    _ => self.info_plist.get(&key).cloned().unwrap_or_default(),
                 };
                 if v.is_empty() {
+                    self.log_once(format!("Info.plist has no string value for {key}"));
                     ret!(0)
                 }
                 let o = self.new_string(mem, &v);
@@ -2597,6 +2642,10 @@ impl<'a> Hle<'a> {
             }
             ("NSError", true, "errorWithDomain:code:userInfo:") => {
                 let o = self.new_obj(mem, "NSError", Obj::Plain);
+                ret!(o)
+            }
+            ("NSUUID", false, "UUIDString") => {
+                let o = self.new_string(mem, "E621E1F8-C36C-495A-93FC-0C247A3E6E5F");
                 ret!(o)
             }
             ("NSUUID", true, "UUID") => {
@@ -3721,6 +3770,7 @@ impl<'a> Hle<'a> {
                 let old = self.objc.set_method_imp(mem, x0, x1);
                 cpu.set_reg(0, old);
             }
+            Kind::MethodExchange if x0 == 0 || x1 == 0 => {}
             Kind::MethodExchange => {
                 let i1 = mem.read_u64(x0.wrapping_add(16)).unwrap_or(0);
                 let i2 = mem.read_u64(x1.wrapping_add(16)).unwrap_or(0);
@@ -3740,7 +3790,20 @@ impl<'a> Hle<'a> {
             }
             Kind::ClassReplaceMethod => {
                 let sel = self.objc.sel_name(mem, x1);
-                let old = self.objc.classes.get_mut(&x0).and_then(|c| c.methods.insert(sel, x2));
+                let old = self.objc.classes.get_mut(&x0).and_then(|c| c.methods.insert(sel.clone(), x2));
+                if x2 == 0 {
+                    // Swizzling: the original implementation (x2) is a system
+                    // one we do not have. The selector that just received the
+                    // old implementation of `sel` is the system selector.
+                    if let Some(prev) = old {
+                        let orig = self.objc.classes.get(&x0).and_then(|c| {
+                            c.methods.iter().find(|(s, i)| **i == prev && **s != sel).map(|(s, _)| s.clone())
+                        });
+                        if let Some(orig_sel) = orig {
+                            self.objc.sys_alias.insert((x0, sel.clone()), orig_sel);
+                        }
+                    }
+                }
                 cpu.set_reg(0, old.unwrap_or(0));
             }
             Kind::ObjcGetProperty => {
@@ -4431,6 +4494,7 @@ pub fn run(
         exe_name: name.clone(),
         exe_path_ptr: 0,
         seen_logs: HashSet::new(),
+        info_plist: bundle.info_plist_strings().into_iter().collect(),
         fs,
         window,
         options,

@@ -78,6 +78,15 @@ impl Bundle {
             .unwrap_or("org.touchhle.app-picker")
     }
 
+    /// The string-valued entries of Info.plist (used by the 64-bit probe to
+    /// answer `-[NSBundle objectForInfoDictionaryKey:]`).
+    pub fn info_plist_strings(&self) -> Vec<(String, String)> {
+        self.plist
+            .iter()
+            .filter_map(|(k, v)| v.as_string().map(|s| (k.clone(), s.to_string())))
+            .collect()
+    }
+
     pub fn bundle_version(&self) -> &str {
         self.plist
             .get("CFBundleVersion")
