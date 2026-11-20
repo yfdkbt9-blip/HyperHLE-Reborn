@@ -204,6 +204,7 @@ enum Kind {
     ObjcCopyStruct,
     DyldImageHeader,
     Gl,
+    Dlsym,
     /// Not implemented: logs the first call and returns 0.
     Unknown,
 }
@@ -223,13 +224,14 @@ fn classify(name: &str) -> Kind {
         "_strncmp" => Kind::Strncmp,
         "___stack_chk_fail" => Kind::StackChkFail,
         "_abort" | "_exit" | "__exit" => Kind::Abort,
-        "___cxa_atexit" | "_atexit" | "_dlsym" | "_pthread_mutex_init" | "_pthread_mutex_lock"
+        "___cxa_atexit" | "_atexit" | "_pthread_mutex_init" | "_pthread_mutex_lock"
         | "_pthread_mutex_unlock" | "_pthread_mutex_destroy" | "_pthread_mutex_trylock"
         | "_pthread_mutexattr_init" | "_pthread_mutexattr_settype"
         | "_pthread_mutexattr_destroy" | "_pthread_cond_init" | "_pthread_cond_destroy"
         | "_pthread_cond_signal" | "_pthread_cond_broadcast" | "_OSSpinLockLock"
         | "_OSSpinLockUnlock" | "_pthread_rwlock_init" | "_pthread_rwlock_rdlock"
         | "_pthread_rwlock_wrlock" | "_pthread_rwlock_unlock" => Kind::ReturnZero,
+        "_dlsym" => Kind::Dlsym,
         "_strncpy" | "___strncpy_chk" => Kind::Strncpy,
         "_strcpy" | "___strcpy_chk" => Kind::Strcpy,
         "_strcat" | "___strcat_chk" => Kind::Strcat,
@@ -310,6 +312,12 @@ fn classify(name: &str) -> Kind {
         | "_objc_retainAutoreleaseReturnValue"
         | "_objc_unsafeClaimAutoreleasedReturnValue"
         | "_objc_claimAutoreleasedReturnValue"
+        // libc++ constructors/destructors return `this` on arm64; the app only
+        // needs them not to crash while their state is not modelled.
+        | "__ZNSt3__16localeC1Ev"
+        | "__ZNSt3__16localeC1ERKS0_"
+        | "__ZNSt3__16localeD1Ev"
+        | "__ZNSt3__112basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEED1Ev"
         | "_sel_getName" => Kind::ReturnX0,
         "_objc_release" => Kind::Free,
         "_objc_storeStrong" => Kind::ObjcStoreStrong,
@@ -1600,6 +1608,14 @@ impl<'a> Hle<'a> {
                 let o = self.new_obj(mem, "NSMutableString", Obj::Str(s));
                 ret!(o)
             }
+            ("NSString", false, "stringByAppendingFormat:") => {
+                // Variadic arguments are on the stack, like stringWithFormat:.
+                let fmt = self.str_of(mem, a2).unwrap_or_default();
+                let tail = self.ns_format(mem, &fmt, sp);
+                let s = self.str_of(mem, recv).unwrap_or_default() + &tail;
+                let o = self.new_string(mem, &s);
+                ret!(o)
+            }
             ("NSString", false, "stringByAppendingString:") => {
                 let s = self.str_of(mem, recv).unwrap_or_default() + &self.str_of(mem, a2).unwrap_or_default();
                 let o = self.new_string(mem, &s);
@@ -2000,6 +2016,46 @@ impl<'a> Hle<'a> {
                     self.dict_set(mem, d, k, v);
                 }
                 ret!(d)
+            }
+            ("NSDictionary", true, "dictionaryWithObjects:forKeys:count:") => {
+                // x2 = id objects[], x3 = id keys[], x4 = count
+                let c = self.class_name(recv);
+                let d = self.new_obj(mem, &c, Obj::Dict(Vec::new()));
+                for i in 0..a4.min(4096) {
+                    let obj = mem.read_u64(a2.wrapping_add(i * 8)).unwrap_or(0);
+                    let key = mem.read_u64(a3.wrapping_add(i * 8)).unwrap_or(0);
+                    if key != 0 {
+                        self.dict_set(mem, d, key, obj);
+                    }
+                }
+                ret!(d)
+            }
+            ("NSDictionary", true, "dictionaryWithObjects:forKeys:") => {
+                // x2 = NSArray of objects, x3 = NSArray of keys
+                let c = self.class_name(recv);
+                let objs = match self.objs.get(&a2) {
+                    Some(Obj::Array(v)) => v.clone(),
+                    _ => Vec::new(),
+                };
+                let keys = match self.objs.get(&a3) {
+                    Some(Obj::Array(v)) => v.clone(),
+                    _ => Vec::new(),
+                };
+                let d = self.new_obj(mem, &c, Obj::Dict(Vec::new()));
+                for (k, o) in keys.iter().zip(objs.iter()) {
+                    self.dict_set(mem, d, *k, *o);
+                }
+                ret!(d)
+            }
+            ("NSDictionary", false, "initWithObjects:forKeys:count:") => {
+                for i in 0..a4.min(4096) {
+                    let obj = mem.read_u64(a2.wrapping_add(i * 8)).unwrap_or(0);
+                    let key = mem.read_u64(a3.wrapping_add(i * 8)).unwrap_or(0);
+                    if key != 0 {
+                        self.dict_set(mem, recv, key, obj);
+                    }
+                }
+                ret!(recv)
             }
             ("NSDictionary", false, "initWithCapacity:") | ("NSDictionary", false, "init") => ret!(recv),
             ("NSDictionary", false, "count") => {
@@ -3719,6 +3775,25 @@ impl<'a> Hle<'a> {
             Kind::DyldImageHeader => {
                 let h = if x0 == 0 { self.image_base } else { 0 };
                 cpu.set_reg(0, h);
+            }
+            Kind::Dlsym => {
+                // dlsym(handle, name): give out the stub of an imported symbol
+                // of that name. Any other symbol gets a stub that returns 0,
+                // so the app's own "symbol not found" checks (often an abort)
+                // do not fire. The names are logged to show what is missing.
+                let sym = Objc::cstr(mem, x1).unwrap_or_default();
+                let want = format!("_{sym}");
+                let stub_of = |i: usize| STUB_BASE + i as u64 * 8;
+                let target = match self.names.iter().position(|n| *n == want) {
+                    Some(i) => Some((stub_of(i), true)),
+                    None => self.kinds.iter().position(|k| *k == Kind::ReturnZero).map(|i| (stub_of(i), false)),
+                };
+                let (addr, exact) = target.unwrap_or((0, false));
+                self.log_once(format!(
+                    "dlsym({sym:?}) -> {addr:#x} ({})",
+                    if exact { "imported symbol" } else { "not imported: no-op stub" }
+                ));
+                cpu.set_reg(0, addr);
             }
             Kind::Gl => {
                 let n = name.clone();
