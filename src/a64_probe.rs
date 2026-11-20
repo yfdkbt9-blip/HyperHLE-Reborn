@@ -21,6 +21,9 @@
 use crate::bundle::Bundle;
 use crate::cpu64::{Context64, Cpu64, GuestBus, StopReason};
 use crate::fs::{Fs, GuestPath, GuestPathBuf};
+use crate::gles::{gles2_raw as gl, gles30_raw as gl30};
+use crate::options::Options;
+use crate::window::{GLContext, GLVersion, Window};
 use crate::mach_o64::{GuestMemory64, MachO64};
 use std::collections::{HashMap, HashSet, VecDeque};
 
@@ -200,6 +203,7 @@ enum Kind {
     DispatchGroupNotify,
     ObjcCopyStruct,
     DyldImageHeader,
+    Gl,
     /// Not implemented: logs the first call and returns 0.
     Unknown,
 }
@@ -315,6 +319,7 @@ fn classify(name: &str) -> Kind {
         "_NSClassFromString" => Kind::NsClassFromString,
         "_NSStringFromClass" => Kind::NsStringFromClass,
         "_object_getClass" => Kind::ObjectGetClass,
+        _ if name.starts_with("_gl") => Kind::Gl,
         _ => Kind::Unknown,
     }
 }
@@ -839,6 +844,20 @@ const NS_NOT_FOUND: u64 = i64::MAX as u64;
 /// Pretend location of the app's sandbox.
 const SANDBOX: &str = "/var/mobile/Containers/Data/Application/00000000-0000-0000-0000-000000000000";
 
+/// State of the OpenGL ES context we made for the app.
+struct GlState {
+    ctx: GLContext,
+    /// The renderbuffer that stands for the screen (from `renderbufferStorage:fromDrawable:`).
+    drawable_rb: u32,
+    present_fbo: u32,
+    size: (i32, i32),
+    array_buf: u32,
+    element_buf: u32,
+    /// Buffers mapped with glMapBufferRange: target -> (staging address, offset, length).
+    mapped: HashMap<u32, (u64, i64, i64)>,
+    presented: u64,
+}
+
 /// Something the main run loop will do later.
 #[derive(Clone, Debug)]
 enum Action {
@@ -889,6 +908,15 @@ struct Hle<'a> {
     exe_path_ptr: u64,
     seen_logs: HashSet<String>,
     fs: &'a Fs,
+    window: &'a mut Window,
+    options: &'a Options,
+    gl: Option<GlState>,
+    /// The current EAGLContext object (0 = none).
+    current_ctx: u64,
+    gl_err: u32,
+    gl_err_logged: u32,
+    gl_strings: HashMap<u32, u64>,
+    unpack_align: i32,
     /// Real guest path of the app bundle in the emulated file system.
     bundle_guest: String,
     /// Files the app wrote this session.
@@ -2592,9 +2620,517 @@ impl<'a> Hle<'a> {
                 self.schedule(due, 0, Action::Send { target: recv, sel: a2, args: vec![a3] }, 0);
                 return true;
             }
+            // ----- EAGL: OpenGL ES contexts -----
+            ("EAGLContext", false, "initWithAPI:") | ("EAGLContext", false, "initWithAPI:sharegroup:") => {
+                if a2 != 2 && a2 != 3 {
+                    log!("[a64] EAGLContext: OpenGL ES API {a2} is not supported");
+                    ret!(0)
+                }
+                if !self.gl_init() {
+                    ret!(0)
+                }
+                self.set_prop(recv, "api", a2);
+                ret!(recv)
+            }
+            ("EAGLContext", true, "setCurrentContext:") => {
+                if a2 != 0 {
+                    self.gl_make_current();
+                }
+                self.current_ctx = a2;
+                ret!(1)
+            }
+            ("EAGLContext", true, "currentContext") => ret!(self.current_ctx),
+            ("EAGLContext", false, "renderbufferStorage:fromDrawable:") => {
+                let ok = self.gl_renderbuffer_storage();
+                ret!(ok as u64)
+            }
+            ("EAGLContext", false, "presentRenderbuffer:") => {
+                self.gl_present();
+                ret!(1)
+            }
+            ("UIView", false, "window") => {
+                let app = self.singleton(mem, "UIApplication", "UIApplication", Obj::Plain);
+                let w = self.prop(app, "keyWindow");
+                ret!(w)
+            }
             _ => return false,
         }
         true
+    }
+
+    // ----- OpenGL ES bridge -----
+    //
+    // Guest memory is ordinary host memory, so pointers into it (vertex data,
+    // textures, indices) can be handed to the driver directly.
+
+    /// Create the OpenGL ES context for the app (once).
+    fn gl_init(&mut self) -> bool {
+        if self.gl.is_some() {
+            return true;
+        }
+        let ctx = match self.window.create_gl_context(GLVersion::GLES30) {
+            Ok(c) => c,
+            Err(e) => {
+                log!("[a64] could not create an OpenGL ES 3.0 context: {e}");
+                return false;
+            }
+        };
+        unsafe {
+            self.window.make_gl_context_current(&ctx);
+        }
+        {
+            let w: &Window = &*self.window;
+            gl30::load_with(|s| w.gl_get_proc_address(s));
+            gl::load_with(|s| w.gl_get_proc_address(s));
+        }
+        let vp = self.window.viewport();
+        let host_fb = self.window.host_framebuffer();
+        echo!("[a64] OpenGL ES context created; window viewport {vp:?}, host framebuffer {host_fb}");
+        self.gl = Some(GlState {
+            ctx,
+            drawable_rb: 0,
+            present_fbo: 0,
+            size: (0, 0),
+            array_buf: 0,
+            element_buf: 0,
+            mapped: HashMap::new(),
+            presented: 0,
+        });
+        true
+    }
+
+    fn gl_make_current(&mut self) {
+        if let Some(g) = &self.gl {
+            unsafe {
+                self.window.make_gl_context_current(&g.ctx);
+            }
+        }
+    }
+
+    /// `-[EAGLContext renderbufferStorage:fromDrawable:]`: give the bound
+    /// renderbuffer the size of the screen and remember it as the one to show.
+    fn gl_renderbuffer_storage(&mut self) -> bool {
+        let w = (SCREEN_W * SCREEN_SCALE) as i32;
+        let h = (SCREEN_H * SCREEN_SCALE) as i32;
+        let Some(g) = self.gl.as_mut() else { return false };
+        unsafe {
+            let mut rb: i32 = 0;
+            gl::GetIntegerv(gl::RENDERBUFFER_BINDING, &mut rb);
+            gl::RenderbufferStorage(gl::RENDERBUFFER, gl30::RGBA8, w, h);
+            g.drawable_rb = rb as u32;
+            g.size = (w, h);
+        }
+        true
+    }
+
+    /// `-[EAGLContext presentRenderbuffer:]`: copy the drawable to the window
+    /// and flip buffers.
+    fn gl_present(&mut self) {
+        let (vx, vy, vw, vh) = self.window.viewport();
+        let host_fb = self.window.host_framebuffer();
+        let Some(g) = self.gl.as_mut() else { return };
+        if g.drawable_rb == 0 {
+            return;
+        }
+        unsafe {
+            let mut prev: i32 = 0;
+            gl::GetIntegerv(gl::FRAMEBUFFER_BINDING, &mut prev);
+            let scissor = gl::IsEnabled(gl::SCISSOR_TEST);
+            gl::Disable(gl::SCISSOR_TEST);
+            if g.present_fbo == 0 {
+                let mut f: u32 = 0;
+                gl::GenFramebuffers(1, &mut f);
+                g.present_fbo = f;
+            }
+            gl::BindFramebuffer(gl::FRAMEBUFFER, g.present_fbo);
+            gl::FramebufferRenderbuffer(gl::FRAMEBUFFER, gl::COLOR_ATTACHMENT0, gl::RENDERBUFFER, g.drawable_rb);
+            gl30::BindFramebuffer(gl30::READ_FRAMEBUFFER, g.present_fbo);
+            gl30::BindFramebuffer(gl30::DRAW_FRAMEBUFFER, host_fb);
+            gl30::BlitFramebuffer(
+                0,
+                0,
+                g.size.0,
+                g.size.1,
+                vx as i32,
+                vy as i32,
+                (vx + vw) as i32,
+                (vy + vh) as i32,
+                gl30::COLOR_BUFFER_BIT,
+                gl30::LINEAR,
+            );
+            gl::BindFramebuffer(gl::FRAMEBUFFER, prev as u32);
+            if scissor != 0 {
+                gl::Enable(gl::SCISSOR_TEST);
+            }
+        }
+        g.presented += 1;
+        self.window.swap_window();
+    }
+
+    /// Host pointer for guest address `addr` (null if it isn't mapped).
+    fn host_ptr(mem: &Mem64, addr: u64) -> *const std::ffi::c_void {
+        mem.read_bytes(addr, 1).map_or(std::ptr::null(), |s| s.as_ptr() as *const std::ffi::c_void)
+    }
+
+    /// Host pointer for `len` bytes at guest address `addr`; null if `addr` is
+    /// 0 or the range isn't fully mapped.
+    fn host_range(mem: &Mem64, addr: u64, len: usize) -> *const std::ffi::c_void {
+        if addr == 0 {
+            return std::ptr::null();
+        }
+        mem.read_bytes(addr, len).map_or(std::ptr::null(), |s| s.as_ptr() as *const std::ffi::c_void)
+    }
+
+    /// Size in bytes of a client-side image, as `glTexImage2D` reads it.
+    fn tex_bytes(format: u32, ty: u32, w: i32, h: i32, align: i32) -> usize {
+        let bpp = match ty {
+            0x8033 | 0x8034 | 0x8363 => 2, // 4444, 5551, 565
+            _ => match format {
+                0x1908 => 4, // RGBA
+                0x1907 => 3, // RGB
+                0x190A => 2, // LUMINANCE_ALPHA
+                0x1909 | 0x1906 => 1,
+                _ => 4,
+            },
+        };
+        let align = align.max(1) as usize;
+        let row = (w.max(0) as usize * bpp + align - 1) / align * align;
+        row * h.max(0) as usize
+    }
+
+    /// Run an imported `gl*` function.
+    fn gl_call(&mut self, cpu: &mut Cpu64, mem: &mut Mem64, name: &str) {
+        if self.gl.is_none() {
+            self.log_once(format!("{name} was called before any EAGLContext existed"));
+            cpu.set_reg(0, 0);
+            return;
+        }
+        let f = name.strip_prefix("_gl").unwrap_or(name);
+        let (a0, a1, a2, a3) = (cpu.reg(0), cpu.reg(1), cpu.reg(2), cpu.reg(3));
+        let (a4, a5, a6, a7) = (cpu.reg(4), cpu.reg(5), cpu.reg(6), cpu.reg(7));
+        let (f0, f1, f2, f3) = (cpu.f32(0), cpu.f32(1), cpu.f32(2), cpu.f32(3));
+        let sp = cpu.sp();
+        // The 9th integer argument is the first one on the stack.
+        let s0 = mem.read_u64(sp).unwrap_or(0);
+        let mut known = true;
+        unsafe {
+            match f {
+                "Clear" => gl::Clear(a0 as u32),
+                "ClearColor" => gl::ClearColor(f0, f1, f2, f3),
+                "Viewport" => gl::Viewport(a0 as i32, a1 as i32, a2 as i32, a3 as i32),
+                "Scissor" => gl::Scissor(a0 as i32, a1 as i32, a2 as i32, a3 as i32),
+                "Enable" => gl::Enable(a0 as u32),
+                "Disable" => gl::Disable(a0 as u32),
+                "IsEnabled" => {
+                    let v = gl::IsEnabled(a0 as u32);
+                    cpu.set_reg(0, v as u64);
+                }
+                "DepthMask" => gl::DepthMask(a0 as u8),
+                "BlendFunc" => gl::BlendFunc(a0 as u32, a1 as u32),
+                "BlendEquation" => gl::BlendEquation(a0 as u32),
+                "Hint" => gl::Hint(a0 as u32, a1 as u32),
+                "PixelStorei" => {
+                    if a0 as u32 == 0x0CF5 {
+                        self.unpack_align = a1 as i32;
+                    }
+                    gl::PixelStorei(a0 as u32, a1 as i32)
+                }
+                "ActiveTexture" => gl::ActiveTexture(a0 as u32),
+                "BindTexture" => gl::BindTexture(a0 as u32, a1 as u32),
+                "TexParameteri" => gl::TexParameteri(a0 as u32, a1 as u32, a2 as i32),
+                "TexParameterf" => gl::TexParameterf(a0 as u32, a1 as u32, f0),
+                "GenerateMipmap" => gl::GenerateMipmap(a0 as u32),
+                "GetError" => {
+                    let host = gl::GetError();
+                    let e = if self.gl_err != 0 { self.gl_err } else { host };
+                    self.gl_err = 0;
+                    cpu.set_reg(0, e as u64);
+                }
+                "GenBuffers" | "GenTextures" | "GenFramebuffers" | "GenRenderbuffers" => {
+                    let n = (a0 as i32).clamp(0, 1024) as usize;
+                    let mut ids = vec![0u32; n];
+                    match f {
+                        "GenBuffers" => gl::GenBuffers(n as i32, ids.as_mut_ptr()),
+                        "GenTextures" => gl::GenTextures(n as i32, ids.as_mut_ptr()),
+                        "GenFramebuffers" => gl::GenFramebuffers(n as i32, ids.as_mut_ptr()),
+                        _ => gl::GenRenderbuffers(n as i32, ids.as_mut_ptr()),
+                    }
+                    let bytes: Vec<u8> = ids.iter().flat_map(|i| i.to_le_bytes()).collect();
+                    mem.write_slice(a1, &bytes);
+                }
+                "DeleteBuffers" | "DeleteTextures" | "DeleteFramebuffers" | "DeleteRenderbuffers" => {
+                    let n = (a0 as i32).clamp(0, 1024) as usize;
+                    let ids: Vec<u32> = (0..n as u64).filter_map(|i| rd32(mem, a1 + i * 4)).collect();
+                    match f {
+                        "DeleteBuffers" => {
+                            gl::DeleteBuffers(ids.len() as i32, ids.as_ptr());
+                            if let Some(g) = self.gl.as_mut() {
+                                if ids.contains(&g.array_buf) {
+                                    g.array_buf = 0;
+                                }
+                                if ids.contains(&g.element_buf) {
+                                    g.element_buf = 0;
+                                }
+                            }
+                        }
+                        "DeleteTextures" => gl::DeleteTextures(ids.len() as i32, ids.as_ptr()),
+                        "DeleteFramebuffers" => gl::DeleteFramebuffers(ids.len() as i32, ids.as_ptr()),
+                        _ => gl::DeleteRenderbuffers(ids.len() as i32, ids.as_ptr()),
+                    }
+                }
+                "BindBuffer" => {
+                    if let Some(g) = self.gl.as_mut() {
+                        match a0 as u32 {
+                            0x8892 => g.array_buf = a1 as u32,
+                            0x8893 => g.element_buf = a1 as u32,
+                            _ => {}
+                        }
+                    }
+                    gl::BindBuffer(a0 as u32, a1 as u32)
+                }
+                "BindFramebuffer" => gl::BindFramebuffer(a0 as u32, a1 as u32),
+                "BindRenderbuffer" => gl::BindRenderbuffer(a0 as u32, a1 as u32),
+                "BufferData" => {
+                    let data = Self::host_range(mem, a2, a1 as usize);
+                    gl::BufferData(a0 as u32, a1 as isize, data, a3 as u32)
+                }
+                "RenderbufferStorage" => gl::RenderbufferStorage(a0 as u32, a1 as u32, a2 as i32, a3 as i32),
+                "RenderbufferStorageMultisampleAPPLE" => {
+                    // multisampling isn't offered; plain storage instead
+                    gl::RenderbufferStorage(a0 as u32, a2 as u32, a3 as i32, a4 as i32)
+                }
+                "FramebufferRenderbuffer" => gl::FramebufferRenderbuffer(a0 as u32, a1 as u32, a2 as u32, a3 as u32),
+                "FramebufferTexture2D" => gl::FramebufferTexture2D(a0 as u32, a1 as u32, a2 as u32, a3 as u32, a4 as i32),
+                "CheckFramebufferStatus" => {
+                    let s = gl::CheckFramebufferStatus(a0 as u32);
+                    cpu.set_reg(0, s as u64);
+                }
+                "GetRenderbufferParameteriv" => {
+                    let mut v: i32 = 0;
+                    gl::GetRenderbufferParameteriv(a0 as u32, a1 as u32, &mut v);
+                    mem.write_slice(a2, &v.to_le_bytes());
+                }
+                "ResolveMultisampleFramebufferAPPLE"
+                | "DiscardFramebufferEXT"
+                | "LabelObjectEXT"
+                | "PushGroupMarkerEXT"
+                | "PopGroupMarkerEXT" => {}
+                "CreateShader" => {
+                    let id = gl::CreateShader(a0 as u32);
+                    cpu.set_reg(0, id as u64);
+                }
+                "CreateProgram" => {
+                    let id = gl::CreateProgram();
+                    cpu.set_reg(0, id as u64);
+                }
+                "DeleteShader" => gl::DeleteShader(a0 as u32),
+                "DeleteProgram" => gl::DeleteProgram(a0 as u32),
+                "AttachShader" => gl::AttachShader(a0 as u32, a1 as u32),
+                "UseProgram" => gl::UseProgram(a0 as u32),
+                "ShaderSource" => {
+                    let count = (a1 as i32).clamp(0, 64) as usize;
+                    let mut sources: Vec<std::ffi::CString> = Vec::new();
+                    for i in 0..count as u64 {
+                        let p = mem.read_u64(a2 + i * 8).unwrap_or(0);
+                        let len = if a3 != 0 { rd32(mem, a3 + i * 4).map(|l| l as i32) } else { None };
+                        let bytes = match len {
+                            Some(l) if l >= 0 => mem.read_bytes(p, l as usize).map(|b| b.to_vec()),
+                            _ => mem.read_c_bytes(p, 1 << 20),
+                        }
+                        .unwrap_or_default();
+                        let clean: Vec<u8> = bytes.into_iter().filter(|b| *b != 0).collect();
+                        sources.push(std::ffi::CString::new(clean).unwrap_or_default());
+                    }
+                    let ptrs: Vec<*const std::os::raw::c_char> = sources.iter().map(|c| c.as_ptr()).collect();
+                    gl::ShaderSource(a0 as u32, count as i32, ptrs.as_ptr(), std::ptr::null());
+                }
+                "CompileShader" | "LinkProgram" => {
+                    let is_shader = f == "CompileShader";
+                    let id = a0 as u32;
+                    let mut ok: i32 = 0;
+                    if is_shader {
+                        gl::CompileShader(id);
+                        gl::GetShaderiv(id, gl::COMPILE_STATUS, &mut ok);
+                    } else {
+                        gl::LinkProgram(id);
+                        gl::GetProgramiv(id, gl::LINK_STATUS, &mut ok);
+                    }
+                    if ok == 0 {
+                        let mut buf = vec![0u8; 2048];
+                        let mut len: i32 = 0;
+                        if is_shader {
+                            gl::GetShaderInfoLog(id, 2048, &mut len, buf.as_mut_ptr() as *mut _);
+                        } else {
+                            gl::GetProgramInfoLog(id, 2048, &mut len, buf.as_mut_ptr() as *mut _);
+                        }
+                        let text = String::from_utf8_lossy(&buf[..(len.max(0) as usize).min(2048)]).into_owned();
+                        log!("[a64] {} {id} failed: {text}", if is_shader { "shader" } else { "program" });
+                    }
+                }
+                "GetShaderiv" | "GetProgramiv" => {
+                    let mut v: i32 = 0;
+                    if f == "GetShaderiv" {
+                        gl::GetShaderiv(a0 as u32, a1 as u32, &mut v);
+                    } else {
+                        gl::GetProgramiv(a0 as u32, a1 as u32, &mut v);
+                    }
+                    mem.write_slice(a2, &v.to_le_bytes());
+                }
+                "GetShaderInfoLog" | "GetProgramInfoLog" => {
+                    let cap = (a1 as i32).clamp(1, 1 << 16) as usize;
+                    let mut buf = vec![0u8; cap];
+                    let mut len: i32 = 0;
+                    if f == "GetShaderInfoLog" {
+                        gl::GetShaderInfoLog(a0 as u32, cap as i32, &mut len, buf.as_mut_ptr() as *mut _);
+                    } else {
+                        gl::GetProgramInfoLog(a0 as u32, cap as i32, &mut len, buf.as_mut_ptr() as *mut _);
+                    }
+                    if a2 != 0 {
+                        mem.write_slice(a2, &len.to_le_bytes());
+                    }
+                    let n = ((len.max(0) as usize) + 1).min(cap);
+                    mem.write_slice(a3, &buf[..n]);
+                }
+                "GetUniformLocation" => {
+                    let nm = Objc::cstr(mem, a1).unwrap_or_default();
+                    let cs = std::ffi::CString::new(nm).unwrap_or_default();
+                    let loc = gl::GetUniformLocation(a0 as u32, cs.as_ptr());
+                    cpu.set_reg(0, loc as i64 as u64);
+                }
+                "BindAttribLocation" => {
+                    let nm = Objc::cstr(mem, a2).unwrap_or_default();
+                    let cs = std::ffi::CString::new(nm).unwrap_or_default();
+                    gl::BindAttribLocation(a0 as u32, a1 as u32, cs.as_ptr());
+                }
+                "Uniform1i" => gl::Uniform1i(a0 as i32, a1 as i32),
+                "Uniform1f" => gl::Uniform1f(a0 as i32, f0),
+                "Uniform2f" => gl::Uniform2f(a0 as i32, f0, f1),
+                "Uniform3f" => gl::Uniform3f(a0 as i32, f0, f1, f2),
+                "Uniform4f" => gl::Uniform4f(a0 as i32, f0, f1, f2, f3),
+                "UniformMatrix4fv" => {
+                    let n = (a1 as i32).clamp(0, 256) as usize;
+                    let p = Self::host_range(mem, a3, n * 64);
+                    if !p.is_null() {
+                        gl::UniformMatrix4fv(a0 as i32, n as i32, a2 as u8, p as *const f32);
+                    }
+                }
+                "EnableVertexAttribArray" => gl::EnableVertexAttribArray(a0 as u32),
+                "DisableVertexAttribArray" => gl::DisableVertexAttribArray(a0 as u32),
+                "VertexAttribPointer" => {
+                    let buffered = self.gl.as_ref().map_or(false, |g| g.array_buf != 0);
+                    let p = if buffered { a5 as usize as *const std::ffi::c_void } else { Self::host_ptr(mem, a5) };
+                    gl::VertexAttribPointer(a0 as u32, a1 as i32, a2 as u32, a3 as u8, a4 as i32, p);
+                }
+                "DrawArrays" => gl::DrawArrays(a0 as u32, a1 as i32, a2 as i32),
+                "DrawElements" => {
+                    let buffered = self.gl.as_ref().map_or(false, |g| g.element_buf != 0);
+                    let p = if buffered { a3 as usize as *const std::ffi::c_void } else { Self::host_ptr(mem, a3) };
+                    gl::DrawElements(a0 as u32, a1 as i32, a2 as u32, p);
+                }
+                "TexImage2D" => {
+                    let (w, h) = (a3 as i32, a4 as i32);
+                    let n = Self::tex_bytes(a6 as u32, a7 as u32, w, h, self.unpack_align);
+                    let p = Self::host_range(mem, s0, n);
+                    if s0 != 0 && p.is_null() {
+                        self.log_once(format!("glTexImage2D: the pixel data at {s0:#x} ({n} bytes) is not mapped"));
+                    }
+                    gl::TexImage2D(a0 as u32, a1 as i32, a2 as i32, w, h, a5 as i32, a6 as u32, a7 as u32, p);
+                }
+                "TexSubImage2D" => {
+                    let (w, h) = (a4 as i32, a5 as i32);
+                    let n = Self::tex_bytes(a6 as u32, a7 as u32, w, h, self.unpack_align);
+                    let p = Self::host_range(mem, s0, n);
+                    if !p.is_null() {
+                        gl::TexSubImage2D(a0 as u32, a1 as i32, a2 as i32, a3 as i32, w, h, a6 as u32, a7 as u32, p);
+                    }
+                }
+                "CompressedTexImage2D" => {
+                    let p = Self::host_range(mem, a7, a6 as usize);
+                    gl::CompressedTexImage2D(a0 as u32, a1 as i32, a2 as u32, a3 as i32, a4 as i32, a5 as i32, a6 as i32, p);
+                }
+                "GetIntegerv" => {
+                    let mut v = [0i32; 16];
+                    gl::GetIntegerv(a0 as u32, v.as_mut_ptr());
+                    let n = match a0 as u32 {
+                        0x0BA2 | 0x0C10 | 0x0C22 | 0x0C23 => 4,
+                        0x0D3A | 0x846D | 0x846E | 0x0B70 => 2,
+                        0x86A3 => {
+                            let mut c: i32 = 0;
+                            gl::GetIntegerv(0x86A2, &mut c);
+                            (c.max(0) as usize).min(16)
+                        }
+                        _ => 1,
+                    };
+                    let bytes: Vec<u8> = v[..n].iter().flat_map(|x| x.to_le_bytes()).collect();
+                    mem.write_slice(a1, &bytes);
+                }
+                "GetString" => {
+                    let key = a0 as u32;
+                    let p = match self.gl_strings.get(&key) {
+                        Some(p) => *p,
+                        None => {
+                            let text = match key {
+                                0x1F00 => "Apple Inc.",
+                                0x1F01 => "Apple A9 GPU",
+                                0x1F02 => "OpenGL ES 2.0 APPLE-12.0.38",
+                                0x8B8C => "OpenGL ES GLSL ES 1.00",
+                                0x1F03 => {
+                                    "GL_EXT_discard_framebuffer GL_OES_rgb8_rgba8 GL_OES_depth_texture \
+                                     GL_OES_packed_depth_stencil GL_OES_element_index_uint \
+                                     GL_OES_standard_derivatives GL_OES_texture_half_float GL_OES_texture_float"
+                                }
+                                _ => "",
+                            };
+                            let p = self.alloc_cstr(mem, text);
+                            self.gl_strings.insert(key, p);
+                            p
+                        }
+                    };
+                    cpu.set_reg(0, p);
+                }
+                "MapBufferRangeEXT" => {
+                    // Data is staged in guest memory and uploaded on unmap.
+                    let len = a2 as i64;
+                    let p = self.heap.alloc(len.max(16) as u64);
+                    if let Some(g) = self.gl.as_mut() {
+                        g.mapped.insert(a0 as u32, (p, a1 as i64, len));
+                    }
+                    cpu.set_reg(0, p);
+                }
+                "UnmapBufferOES" => {
+                    let staged = self.gl.as_mut().and_then(|g| g.mapped.remove(&(a0 as u32)));
+                    if let Some((p, off, len)) = staged {
+                        let data = Self::host_range(mem, p, len.max(0) as usize);
+                        if !data.is_null() {
+                            gl::BufferSubData(a0 as u32, off as isize, len as isize, data);
+                        }
+                    }
+                    cpu.set_reg(0, 1);
+                }
+                _ => {
+                    known = false;
+                }
+            }
+        }
+        if !known {
+            self.log_once(format!("unimplemented OpenGL function {name}"));
+            cpu.set_reg(0, 0);
+            return;
+        }
+        // Remember the first error of a call, so it can be logged once and
+        // still be returned by the app's own glGetError.
+        if f != "GetError" {
+            let e = unsafe { gl::GetError() };
+            if e != 0 {
+                if self.gl_err == 0 {
+                    self.gl_err = e;
+                }
+                if self.gl_err_logged < 40 {
+                    self.gl_err_logged += 1;
+                    log!("[a64] OpenGL error {e:#x} after {name}");
+                }
+            }
+        }
     }
 
     // ----- files -----
@@ -3184,6 +3720,10 @@ impl<'a> Hle<'a> {
                 let h = if x0 == 0 { self.image_base } else { 0 };
                 cpu.set_reg(0, h);
             }
+            Kind::Gl => {
+                let n = name.clone();
+                self.gl_call(cpu, mem, &n);
+            }
             Kind::Unknown => {
                 if self.seen.insert(id) {
                     log!("[a64] first call to unimplemented {name} (from {lr:#x}); returning 0");
@@ -3425,7 +3965,7 @@ impl<'a> Machine<'a> {
             }
         }
         self.show_windows();
-        self.run_loop(300);
+        self.run_loop(u32::MAX);
     }
 
     /// Run one entry of the run loop.
@@ -3492,6 +4032,14 @@ impl<'a> Machine<'a> {
         echo!("[a64] main run loop: running up to {frames} frames");
         for frame in 0..frames {
             self.hle.vtime += 16_666_667;
+            let presented_before = self.hle.gl.as_ref().map_or(0, |g| g.presented);
+            self.hle.window.poll_for_events(self.hle.options);
+            while let Some(ev) = self.hle.window.pop_event() {
+                if matches!(ev, crate::window::Event::Quit | crate::window::Event::CloseWindow) {
+                    echo!("[a64] the window was closed after {frame} frames");
+                    return;
+                }
+            }
             let now = self.hle.vtime;
             let mut due = Vec::new();
             let mut later = Vec::new();
@@ -3528,6 +4076,14 @@ impl<'a> Machine<'a> {
             }
             if !self.hle.visible_windows.is_empty() {
                 self.show_windows();
+            }
+            // Without a shown frame nothing paces the loop; do it ourselves.
+            let presented_after = self.hle.gl.as_ref().map_or(0, |g| g.presented);
+            if presented_after == presented_before {
+                std::thread::sleep(std::time::Duration::from_millis(16));
+            }
+            if frame == 120 || frame == 1800 {
+                self.summary();
             }
         }
         echo!("[a64] the run loop ran all {frames} frames without a failure");
@@ -3581,7 +4137,13 @@ impl<'a> Machine<'a> {
 }
 
 /// Entry point, called from `main` for 64-bit-only apps.
-pub fn run(bundle: &Bundle, fs: &Fs, exe: &[u8]) -> Result<(), String> {
+pub fn run(
+    bundle: &Bundle,
+    fs: &Fs,
+    exe: &[u8],
+    window: &mut Window,
+    options: &Options,
+) -> Result<(), String> {
     let exe_path = bundle.executable_path();
     let name = exe_path.file_name().unwrap_or("executable").to_string();
     echo!("[a64] === experimental 64-bit probe: {name} ===");
@@ -3653,6 +4215,14 @@ pub fn run(bundle: &Bundle, fs: &Fs, exe: &[u8]) -> Result<(), String> {
         exe_path_ptr: 0,
         seen_logs: HashSet::new(),
         fs,
+        window,
+        options,
+        gl: None,
+        current_ctx: 0,
+        gl_err: 0,
+        gl_err_logged: 0,
+        gl_strings: HashMap::new(),
+        unpack_align: 4,
         bundle_guest: bundle.bundle_path().as_str().to_string(),
         overlay: HashMap::new(),
         props: HashMap::new(),
