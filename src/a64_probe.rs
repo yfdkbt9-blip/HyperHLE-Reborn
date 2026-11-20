@@ -212,6 +212,15 @@ enum Kind {
     CfStringCreate,
     CfDictionaryCreate,
     Socketpair,
+    MathF64,
+    MathF32,
+    Printf,
+    Puts,
+    StdStringInit,
+    StdStringAssign,
+    StdStringAssignChar,
+    StdStringCopy,
+    StdStringCompare,
     Vsnprintf,
     SecItemNotFound,
     /// Not implemented: logs the first call and returns 0.
@@ -248,6 +257,17 @@ fn classify(name: &str) -> Kind {
         "_CFStringCreateWithCString" => Kind::CfStringCreate,
         "_CFDictionaryCreate" => Kind::CfDictionaryCreate,
         "_socketpair" => Kind::Socketpair,
+        "_pow" | "_sin" | "_cos" | "_tan" | "_atan" | "_atan2" | "_sqrt" | "_exp" | "_log" | "_log10"
+        | "_floor" | "_ceil" | "_fmod" | "_asin" | "_acos" => Kind::MathF64,
+        "_powf" | "_sinf" | "_cosf" | "_tanf" | "_atanf" | "_atan2f" | "_sqrtf" | "_expf" | "_logf"
+        | "_floorf" | "_ceilf" | "_fmodf" | "_asinf" | "_acosf" => Kind::MathF32,
+        "_printf" => Kind::Printf,
+        "_puts" => Kind::Puts,
+        "__ZNSt3__112basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEE6__initEPKcm" => Kind::StdStringInit,
+        "__ZNSt3__112basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEE6assignEPKc" => Kind::StdStringAssign,
+        "__ZNSt3__112basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEEaSEc" => Kind::StdStringAssignChar,
+        "__ZNSt3__112basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEEC1ERKS5_" => Kind::StdStringCopy,
+        "__ZNKSt3__112basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEE7compareEPKc" => Kind::StdStringCompare,
         "_vsnprintf" => Kind::Vsnprintf,
         "_SecItemCopyMatching" => Kind::SecItemNotFound,
         "_strncpy" | "___strncpy_chk" => Kind::Strncpy,
@@ -1926,6 +1946,39 @@ impl<'a> Hle<'a> {
                 let o = self.new_obj(mem, &c, Obj::Array(items));
                 ret!(o)
             }
+            ("NSArray", false, "countByEnumeratingWithState:objects:count:") => {
+                // for-in loops. a2 = NSFastEnumerationState { state, itemsPtr,
+                // mutationsPtr, extra[5] }, a3 = caller's buffer, a4 = its length.
+                let items = match self.objs.get(&recv) {
+                    Some(Obj::Array(v)) => v.clone(),
+                    _ => Vec::new(),
+                };
+                let start = mem.read_u64(a2).unwrap_or(0) as usize;
+                let n = items.len().saturating_sub(start).min(a4 as usize);
+                for i in 0..n {
+                    mem.write_u64(a3.wrapping_add(i as u64 * 8), items[start + i]);
+                }
+                mem.write_u64(a2, (start + n) as u64);
+                mem.write_u64(a2.wrapping_add(8), a3);
+                mem.write_u64(a2.wrapping_add(16), a2.wrapping_add(24));
+                ret!(n as u64)
+            }
+            ("NSDictionary", false, "countByEnumeratingWithState:objects:count:") => {
+                // Dictionaries are enumerated by key.
+                let keys: Vec<u64> = match self.objs.get(&recv) {
+                    Some(Obj::Dict(v)) => v.iter().map(|(k, _)| *k).collect(),
+                    _ => Vec::new(),
+                };
+                let start = mem.read_u64(a2).unwrap_or(0) as usize;
+                let n = keys.len().saturating_sub(start).min(a4 as usize);
+                for i in 0..n {
+                    mem.write_u64(a3.wrapping_add(i as u64 * 8), keys[start + i]);
+                }
+                mem.write_u64(a2, (start + n) as u64);
+                mem.write_u64(a2.wrapping_add(8), a3);
+                mem.write_u64(a2.wrapping_add(16), a2.wrapping_add(24));
+                ret!(n as u64)
+            }
             ("NSArray", false, "initWithObjects:") => {
                 // object1, object2, ..., nil (variadic arguments are on the stack)
                 let mut items = Vec::new();
@@ -3477,6 +3530,39 @@ impl<'a> Hle<'a> {
         self.schedule(due, repeat, Action::Send { target, sel, args: vec![t] }, t);
     }
 
+    /// Contents of a libc++ `std::string` (Apple arm64 layout: short strings keep
+    /// their characters in bytes 0..22 and the length in byte 23; a long string
+    /// is { data pointer, length, capacity | 1 << 63 }).
+    fn std_string_read(&self, mem: &Mem64, this: u64) -> Vec<u8> {
+        let last = mem.read_bytes(this.wrapping_add(23), 1).map_or(0, |b| b[0]);
+        if last & 0x80 == 0 {
+            let n = (last as usize).min(23);
+            mem.read_bytes(this, n).map(|b| b.to_vec()).unwrap_or_default()
+        } else {
+            let p = mem.read_u64(this).unwrap_or(0);
+            let n = mem.read_u64(this.wrapping_add(8)).unwrap_or(0) as usize;
+            mem.read_bytes(p, n.min(1 << 24)).map(|b| b.to_vec()).unwrap_or_default()
+        }
+    }
+
+    /// Store `bytes` into the `std::string` at `this` (the old buffer is leaked).
+    fn std_string_write(&mut self, mem: &mut Mem64, this: u64, bytes: &[u8]) {
+        let n = bytes.len();
+        if n <= 22 {
+            let mut buf = [0u8; 24];
+            buf[..n].copy_from_slice(bytes);
+            buf[23] = n as u8;
+            mem.write_slice(this, &buf);
+        } else {
+            let cap = (n as u64 + 1 + 15) & !15;
+            let p = self.alloc(cap);
+            mem.write_slice(p, bytes); // heap memory is zeroed, so it ends in NUL
+            mem.write_u64(this, p);
+            mem.write_u64(this.wrapping_add(8), n as u64);
+            mem.write_u64(this.wrapping_add(16), cap | (1u64 << 63));
+        }
+    }
+
     fn handle(&mut self, cpu: &mut Cpu64, mem: &mut Mem64, id: u32) -> Flow {
         let Some(&kind) = self.kinds.get(id as usize) else {
             return Flow::Done(format!("svc #{id} does not match any stub"));
@@ -3913,6 +3999,90 @@ impl<'a> Hle<'a> {
             Kind::DyldImageHeader => {
                 let h = if x0 == 0 { self.image_base } else { 0 };
                 cpu.set_reg(0, h);
+            }
+            Kind::MathF64 => {
+                let (a, b) = (cpu.f64(0), cpu.f64(1));
+                let r = match name.as_str() {
+                    "_pow" => a.powf(b),
+                    "_sin" => a.sin(),
+                    "_cos" => a.cos(),
+                    "_tan" => a.tan(),
+                    "_atan" => a.atan(),
+                    "_atan2" => a.atan2(b),
+                    "_sqrt" => a.sqrt(),
+                    "_exp" => a.exp(),
+                    "_log" => a.ln(),
+                    "_log10" => a.log10(),
+                    "_floor" => a.floor(),
+                    "_ceil" => a.ceil(),
+                    "_fmod" => a % b,
+                    "_asin" => a.asin(),
+                    "_acos" => a.acos(),
+                    _ => 0.0,
+                };
+                cpu.set_f64(0, r);
+            }
+            Kind::MathF32 => {
+                let (a, b) = (cpu.f32(0), cpu.f32(1));
+                let r = match name.as_str() {
+                    "_powf" => a.powf(b),
+                    "_sinf" => a.sin(),
+                    "_cosf" => a.cos(),
+                    "_tanf" => a.tan(),
+                    "_atanf" => a.atan(),
+                    "_atan2f" => a.atan2(b),
+                    "_sqrtf" => a.sqrt(),
+                    "_expf" => a.exp(),
+                    "_logf" => a.ln(),
+                    "_floorf" => a.floor(),
+                    "_ceilf" => a.ceil(),
+                    "_fmodf" => a % b,
+                    "_asinf" => a.asin(),
+                    "_acosf" => a.acos(),
+                    _ => 0.0,
+                };
+                cpu.set_f32(0, r);
+            }
+            Kind::Printf => {
+                // The app's own diagnostics (assertions, debug output) show up in our log.
+                let fmt = Objc::cstr(mem, x0).unwrap_or_default();
+                let text = self.ns_format(mem, &fmt, cpu.sp());
+                self.log_once(format!("printf: {}", text.trim_end()));
+                cpu.set_reg(0, text.len() as u64);
+            }
+            Kind::Puts => {
+                let text = Objc::cstr(mem, x0).unwrap_or_default();
+                self.log_once(format!("puts: {text}"));
+                cpu.set_reg(0, 1);
+            }
+            Kind::StdStringInit => {
+                // basic_string::__init(const char *s, size_t n)
+                let bytes = mem.read_bytes(x1, x2.min(1 << 24) as usize).map(|b| b.to_vec()).unwrap_or_default();
+                self.std_string_write(mem, x0, &bytes);
+            }
+            Kind::StdStringAssign => {
+                let bytes = mem.read_c_bytes(x1, 1 << 24).unwrap_or_default();
+                self.std_string_write(mem, x0, &bytes);
+                cpu.set_reg(0, x0);
+            }
+            Kind::StdStringAssignChar => {
+                self.std_string_write(mem, x0, &[x1 as u8]);
+                cpu.set_reg(0, x0);
+            }
+            Kind::StdStringCopy => {
+                let bytes = self.std_string_read(mem, x1);
+                self.std_string_write(mem, x0, &bytes);
+                cpu.set_reg(0, x0);
+            }
+            Kind::StdStringCompare => {
+                let a = self.std_string_read(mem, x0);
+                let b = mem.read_c_bytes(x1, 1 << 24).unwrap_or_default();
+                let r: i64 = match a.cmp(&b) {
+                    std::cmp::Ordering::Less => -1,
+                    std::cmp::Ordering::Equal => 0,
+                    std::cmp::Ordering::Greater => 1,
+                };
+                cpu.set_reg(0, r as u64);
             }
             Kind::NsTemporaryDirectory => {
                 let s = format!("{SANDBOX}/tmp/");
@@ -4428,6 +4598,10 @@ impl<'a> Machine<'a> {
         log!("[a64]   pc = {}", self.describe(self.cpu.pc()));
         log!("[a64]   lr = {}", self.describe(self.cpu.lr()));
         self.dump_code(self.cpu.lr());
+        if self.cpu.pc() != self.cpu.lr() {
+            log!("[a64]   code around pc:");
+            self.dump_code(self.cpu.pc());
+        }
         let skip = self.hle.recent.len().saturating_sub(24);
         for c in self.hle.recent.iter().skip(skip) {
             log!("[a64]   recent: {c}");
