@@ -213,6 +213,9 @@ enum Kind {
     CfDictionaryCreate,
     Socketpair,
     MathF64,
+    Stdio,
+    CgRect,
+    Strcasecmp,
     MathF32,
     Printf,
     Puts,
@@ -261,6 +264,19 @@ fn classify(name: &str) -> Kind {
         | "_floor" | "_ceil" | "_fmod" | "_asin" | "_acos" => Kind::MathF64,
         "_powf" | "_sinf" | "_cosf" | "_tanf" | "_atanf" | "_atan2f" | "_sqrtf" | "_expf" | "_logf"
         | "_floorf" | "_ceilf" | "_fmodf" | "_asinf" | "_acosf" => Kind::MathF32,
+        "_fopen" | "_open" | "_fclose" | "_close" | "_fread" | "_read" | "_fwrite" | "_write" | "_fseek"
+        | "_lseek" | "_ftell" | "_rewind" | "_feof" | "_ferror" | "_fflush" | "_fgets" | "_fgetc" | "_fileno"
+        | "_fstat" | "_stat" | "_access" => Kind::Stdio,
+        "_strcasecmp" | "_strncasecmp" => Kind::Strcasecmp,
+        // Objects of CoreGraphics that the app only passes around. Drawing into a
+        // bitmap context is not done yet (the calls return 0 and change nothing),
+        // but the app crashes if creating the context fails.
+        "_CGColorSpaceCreateDeviceRGB" | "_CGBitmapContextCreate" | "_CGBitmapContextCreateImage"
+        | "_CGColorCreate" | "_CGGradientCreateWithColorComponents" | "_CGGradientCreateWithColors"
+        | "_CGPathCreateMutable" => Kind::NewHandle,
+        "_CGRectGetMinX" | "_CGRectGetMinY" | "_CGRectGetMaxX" | "_CGRectGetMaxY" | "_CGRectGetMidX"
+        | "_CGRectGetMidY" | "_CGRectGetWidth" | "_CGRectGetHeight" => Kind::CgRect,
+        "_CGColorSpaceRelease" => Kind::ReturnZero,
         "_printf" => Kind::Printf,
         "_puts" => Kind::Puts,
         "__ZNSt3__112basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEE6__initEPKcm" => Kind::StdStringInit,
@@ -956,6 +972,17 @@ fn fnv_hash(s: &str) -> u64 {
 
 /// All "high-level emulation" state: the imported functions and their
 /// bookkeeping.
+/// An open C stdio file (`FILE *`) or file descriptor.
+struct CFile {
+    path: String,
+    /// Contents of a file opened for reading (a file opened for writing lives
+    /// in `Hle::overlay` instead).
+    data: Vec<u8>,
+    pos: usize,
+    writable: bool,
+    fd: u64,
+}
+
 struct Hle<'a> {
     names: Vec<String>,
     kinds: Vec<Kind>,
@@ -989,6 +1016,10 @@ struct Hle<'a> {
     bundle_guest: String,
     /// Files the app wrote this session.
     overlay: HashMap<String, Vec<u8>>,
+    /// Open stdio files by `FILE *`, and file descriptor -> `FILE *`.
+    cfiles: HashMap<u64, CFile>,
+    cfds: HashMap<u64, u64>,
+    next_fd: u64,
     /// Generic UIKit properties: (object, name) -> [X2, D0, D1, D2, D3].
     props: HashMap<(u64, String), [u64; 5]>,
     visible_windows: Vec<u64>,
@@ -3530,6 +3561,246 @@ impl<'a> Hle<'a> {
         self.schedule(due, repeat, Action::Send { target, sel, args: vec![t] }, t);
     }
 
+    fn cfile_key(&self, h: u64) -> Option<u64> {
+        if self.cfiles.contains_key(&h) {
+            Some(h)
+        } else {
+            self.cfds.get(&h).copied()
+        }
+    }
+
+    fn cfile_len(&self, key: u64) -> usize {
+        match self.cfiles.get(&key) {
+            Some(f) if f.writable => self.overlay.get(&f.path).map_or(0, |d| d.len()),
+            Some(f) => f.data.len(),
+            None => 0,
+        }
+    }
+
+    /// Read up to `max` bytes at the file position and advance it.
+    fn cfile_read(&mut self, key: u64, max: usize) -> Vec<u8> {
+        let Some(f) = self.cfiles.get_mut(&key) else { return Vec::new() };
+        let src: &[u8] = if f.writable {
+            match self.overlay.get(&f.path) {
+                Some(d) => d.as_slice(),
+                None => &[],
+            }
+        } else {
+            f.data.as_slice()
+        };
+        let end = f.pos.saturating_add(max).min(src.len());
+        let start = f.pos.min(end);
+        let out = src[start..end].to_vec();
+        f.pos = end;
+        out
+    }
+
+    fn cfile_write(&mut self, key: u64, bytes: &[u8]) {
+        let Some(f) = self.cfiles.get_mut(&key) else { return };
+        if !f.writable {
+            return;
+        }
+        let buf = self.overlay.entry(f.path.clone()).or_default();
+        if f.pos > buf.len() {
+            buf.resize(f.pos, 0);
+        }
+        let end = f.pos + bytes.len();
+        if end > buf.len() {
+            buf.resize(end, 0);
+        }
+        buf[f.pos..end].copy_from_slice(bytes);
+        f.pos = end;
+    }
+
+    /// C stdio and POSIX file calls, served from the emulated file system
+    /// (the app bundle and its sandbox); written files stay in memory.
+    fn stdio_call(&mut self, cpu: &mut Cpu64, mem: &mut Mem64, name: &str) {
+        let (x0, x1, x2, x3) = (cpu.reg(0), cpu.reg(1), cpu.reg(2), cpu.reg(3));
+        let err: u64 = u64::MAX; // -1
+        match name {
+            "_fopen" | "_open" => {
+                let path = Objc::cstr(mem, x0).unwrap_or_default();
+                let is_fopen = name == "_fopen";
+                let (writable, append, truncate, create) = if is_fopen {
+                    let m = Objc::cstr(mem, x1).unwrap_or_default();
+                    let w = m.starts_with('w');
+                    let a = m.starts_with('a');
+                    (w || a || m.contains('+'), a, w, w || a)
+                } else {
+                    // open(path, flags): O_WRONLY 1, O_RDWR 2, O_APPEND 8, O_CREAT 0x200, O_TRUNC 0x400
+                    (x1 & 3 != 0, x1 & 8 != 0, x1 & 0x400 != 0, x1 & 0x200 != 0)
+                };
+                let fail = if is_fopen { 0 } else { err };
+                let existing = self.read_file(&path);
+                if existing.is_none() && !(writable && create) {
+                    self.log_once(format!("{name}({path:?}) failed: no such file"));
+                    cpu.set_reg(0, fail);
+                    return;
+                }
+                let mut data = existing.unwrap_or_default();
+                if truncate {
+                    data.clear();
+                }
+                let pos = if append { data.len() } else { 0 };
+                if writable {
+                    self.overlay.insert(path.clone(), data.clone());
+                }
+                let handle = self.alloc(64);
+                let fd = self.next_fd;
+                self.next_fd += 1;
+                let kept = if writable { Vec::new() } else { data };
+                self.cfiles.insert(handle, CFile { path, data: kept, pos, writable, fd });
+                self.cfds.insert(fd, handle);
+                cpu.set_reg(0, if is_fopen { handle } else { fd });
+            }
+            "_fclose" | "_close" => {
+                if let Some(key) = self.cfile_key(x0) {
+                    if let Some(f) = self.cfiles.remove(&key) {
+                        self.cfds.remove(&f.fd);
+                    }
+                }
+                cpu.set_reg(0, 0);
+            }
+            "_fread" | "_read" => {
+                let is_fread = name == "_fread";
+                let (buf, total, size, handle) = if is_fread {
+                    (x0, x1.saturating_mul(x2).min(1 << 28) as usize, x1 as usize, x3)
+                } else {
+                    (x1, x2.min(1 << 28) as usize, 1usize, x0)
+                };
+                let Some(key) = self.cfile_key(handle) else {
+                    cpu.set_reg(0, if is_fread { 0 } else { err });
+                    return;
+                };
+                let bytes = self.cfile_read(key, total);
+                mem.write_slice(buf, &bytes);
+                let ret = if is_fread {
+                    if size == 0 {
+                        0
+                    } else {
+                        bytes.len() / size
+                    }
+                } else {
+                    bytes.len()
+                };
+                cpu.set_reg(0, ret as u64);
+            }
+            "_fwrite" | "_write" => {
+                let (ptr, total, handle) = if name == "_fwrite" {
+                    (x0, x1.saturating_mul(x2).min(1 << 28) as usize, x3)
+                } else {
+                    (x1, x2.min(1 << 28) as usize, x0)
+                };
+                if let Some(key) = self.cfile_key(handle) {
+                    let bytes = mem.read_bytes(ptr, total).map(|b| b.to_vec()).unwrap_or_default();
+                    self.cfile_write(key, &bytes);
+                }
+                // fwrite returns the item count, write the byte count: both are x2.
+                cpu.set_reg(0, x2);
+            }
+            "_fseek" | "_lseek" => {
+                let Some(key) = self.cfile_key(x0) else {
+                    cpu.set_reg(0, err);
+                    return;
+                };
+                let len = self.cfile_len(key) as i64;
+                if let Some(f) = self.cfiles.get_mut(&key) {
+                    let base = match x2 {
+                        0 => 0,
+                        1 => f.pos as i64,
+                        _ => len,
+                    };
+                    let new = (base + x1 as i64).max(0);
+                    f.pos = new as usize;
+                    cpu.set_reg(0, if name == "_lseek" { new as u64 } else { 0 });
+                }
+            }
+            "_ftell" => {
+                let p = self.cfile_key(x0).and_then(|k| self.cfiles.get(&k)).map_or(err, |f| f.pos as u64);
+                cpu.set_reg(0, p);
+            }
+            "_rewind" => {
+                if let Some(k) = self.cfile_key(x0) {
+                    if let Some(f) = self.cfiles.get_mut(&k) {
+                        f.pos = 0;
+                    }
+                }
+            }
+            "_feof" => {
+                let r = match self.cfile_key(x0) {
+                    Some(k) => {
+                        let len = self.cfile_len(k);
+                        self.cfiles.get(&k).map_or(1, |f| (f.pos >= len) as u64)
+                    }
+                    None => 1,
+                };
+                cpu.set_reg(0, r);
+            }
+            "_ferror" | "_fflush" => cpu.set_reg(0, 0),
+            "_fgets" => {
+                let Some(key) = self.cfile_key(x2) else {
+                    cpu.set_reg(0, 0);
+                    return;
+                };
+                let max = (x1 as usize).saturating_sub(1);
+                let mut out = Vec::new();
+                while out.len() < max {
+                    let b = self.cfile_read(key, 1);
+                    let Some(&c) = b.first() else { break };
+                    out.push(c);
+                    if c == b'\n' {
+                        break;
+                    }
+                }
+                if out.is_empty() {
+                    cpu.set_reg(0, 0);
+                    return;
+                }
+                out.push(0);
+                mem.write_slice(x0, &out);
+                cpu.set_reg(0, x0);
+            }
+            "_fgetc" => {
+                let b = self.cfile_key(x0).map(|k| self.cfile_read(k, 1)).unwrap_or_default();
+                cpu.set_reg(0, b.first().map_or(err, |&c| c as u64));
+            }
+            "_fileno" => {
+                let fd = self.cfile_key(x0).and_then(|k| self.cfiles.get(&k)).map_or(2, |f| f.fd);
+                cpu.set_reg(0, fd);
+            }
+            "_fstat" | "_stat" => {
+                let (exists, is_dir, size) = if name == "_fstat" {
+                    match self.cfile_key(x0) {
+                        Some(k) => (true, false, self.cfile_len(k) as u64),
+                        None => (false, false, 0),
+                    }
+                } else {
+                    let path = Objc::cstr(mem, x0).unwrap_or_default();
+                    let (e, d) = self.file_exists(&path);
+                    let size = if e && !d { self.read_file(&path).map_or(0, |v| v.len() as u64) } else { 0 };
+                    (e, d, size)
+                };
+                if !exists {
+                    cpu.set_reg(0, err);
+                    return;
+                }
+                // struct stat (arm64 Darwin, 144 bytes): st_mode at 4, st_size at 96.
+                let mut st = [0u8; 144];
+                let mode: u16 = if is_dir { 0o040755 } else { 0o100644 };
+                st[4..6].copy_from_slice(&mode.to_le_bytes());
+                st[96..104].copy_from_slice(&size.to_le_bytes());
+                mem.write_slice(x1, &st);
+                cpu.set_reg(0, 0);
+            }
+            "_access" => {
+                let path = Objc::cstr(mem, x0).unwrap_or_default();
+                let (e, _) = self.file_exists(&path);
+                cpu.set_reg(0, if e { 0 } else { err });
+            }
+            _ => cpu.set_reg(0, 0),
+        }
+    }
+
     /// Contents of a libc++ `std::string` (Apple arm64 layout: short strings keep
     /// their characters in bytes 0..22 and the length in byte 23; a long string
     /// is { data pointer, length, capacity | 1 << 63 }).
@@ -3999,6 +4270,37 @@ impl<'a> Hle<'a> {
             Kind::DyldImageHeader => {
                 let h = if x0 == 0 { self.image_base } else { 0 };
                 cpu.set_reg(0, h);
+            }
+            Kind::CgRect => {
+                // A CGRect arrives in d0..d3: x, y, width, height.
+                let (x, y, w, h) = (cpu.f64(0), cpu.f64(1), cpu.f64(2), cpu.f64(3));
+                let r = match name.as_str() {
+                    "_CGRectGetMinX" => x,
+                    "_CGRectGetMinY" => y,
+                    "_CGRectGetMaxX" => x + w,
+                    "_CGRectGetMaxY" => y + h,
+                    "_CGRectGetMidX" => x + w / 2.0,
+                    "_CGRectGetMidY" => y + h / 2.0,
+                    "_CGRectGetWidth" => w,
+                    "_CGRectGetHeight" => h,
+                    _ => 0.0,
+                };
+                cpu.set_f64(0, r);
+            }
+            Kind::Stdio => {
+                let n = name.clone();
+                self.stdio_call(cpu, mem, &n);
+            }
+            Kind::Strcasecmp => {
+                let limit = if name == "_strncasecmp" { x2 as usize } else { 1 << 24 };
+                let a = mem.read_c_bytes(x0, limit).unwrap_or_default().to_ascii_lowercase();
+                let b = mem.read_c_bytes(x1, limit).unwrap_or_default().to_ascii_lowercase();
+                let r: i64 = match a.cmp(&b) {
+                    std::cmp::Ordering::Less => -1,
+                    std::cmp::Ordering::Equal => 0,
+                    std::cmp::Ordering::Greater => 1,
+                };
+                cpu.set_reg(0, r as u64);
             }
             Kind::MathF64 => {
                 let (a, b) = (cpu.f64(0), cpu.f64(1));
@@ -4740,6 +5042,9 @@ pub fn run(
         unpack_align: 4,
         bundle_guest: bundle.bundle_path().as_str().to_string(),
         overlay: HashMap::new(),
+        cfiles: HashMap::new(),
+        cfds: HashMap::new(),
+        next_fd: 100,
         props: HashMap::new(),
         visible_windows: Vec::new(),
         vtime: 0,
