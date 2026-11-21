@@ -214,6 +214,8 @@ enum Kind {
     Socketpair,
     MathF64,
     Stdio,
+    Strstr,
+    MemsetPattern16,
     CgRect,
     Strcasecmp,
     MathF32,
@@ -266,7 +268,9 @@ fn classify(name: &str) -> Kind {
         | "_floorf" | "_ceilf" | "_fmodf" | "_asinf" | "_acosf" => Kind::MathF32,
         "_fopen" | "_open" | "_fclose" | "_close" | "_fread" | "_read" | "_fwrite" | "_write" | "_fseek"
         | "_lseek" | "_ftell" | "_rewind" | "_feof" | "_ferror" | "_fflush" | "_fgets" | "_fgetc" | "_fileno"
-        | "_fstat" | "_stat" | "_access" => Kind::Stdio,
+        | "_fstat" | "_stat" | "_access" | "_mmap" => Kind::Stdio,
+        "_strstr" => Kind::Strstr,
+        "_memset_pattern16" => Kind::MemsetPattern16,
         "_strcasecmp" | "_strncasecmp" => Kind::Strcasecmp,
         // Objects of CoreGraphics that the app only passes around. Drawing into a
         // bitmap context is not done yet (the calls return 0 and change nothing),
@@ -3615,7 +3619,7 @@ impl<'a> Hle<'a> {
     /// C stdio and POSIX file calls, served from the emulated file system
     /// (the app bundle and its sandbox); written files stay in memory.
     fn stdio_call(&mut self, cpu: &mut Cpu64, mem: &mut Mem64, name: &str) {
-        let (x0, x1, x2, x3) = (cpu.reg(0), cpu.reg(1), cpu.reg(2), cpu.reg(3));
+        let (x0, x1, x2, x3, x4) = (cpu.reg(0), cpu.reg(1), cpu.reg(2), cpu.reg(3), cpu.reg(4));
         let err: u64 = u64::MAX; // -1
         match name {
             "_fopen" | "_open" => {
@@ -3648,6 +3652,9 @@ impl<'a> Hle<'a> {
                 let handle = self.alloc(64);
                 let fd = self.next_fd;
                 self.next_fd += 1;
+                if self.seen_logs.len() < 4000 {
+                    self.log_once(format!("{name}({path:?}) ok, {} bytes{}", data.len(), if writable { ", for writing" } else { "" }));
+                }
                 let kept = if writable { Vec::new() } else { data };
                 self.cfiles.insert(handle, CFile { path, data: kept, pos, writable, fd });
                 self.cfds.insert(fd, handle);
@@ -3791,6 +3798,26 @@ impl<'a> Hle<'a> {
                 st[96..104].copy_from_slice(&size.to_le_bytes());
                 mem.write_slice(x1, &st);
                 cpu.set_reg(0, 0);
+            }
+            "_mmap" => {
+                // mmap(addr, len, prot, flags, fd, offset): a copy of the file (or zeroes) in the heap.
+                let len = x1.min(1 << 28);
+                let p = self.alloc(len.max(16));
+                if let Some(key) = self.cfile_key(x4) {
+                    let all = match self.cfiles.get(&key) {
+                        Some(f) if f.writable => self.overlay.get(&f.path).cloned().unwrap_or_default(),
+                        Some(f) => f.data.clone(),
+                        None => Vec::new(),
+                    };
+                    let start = (cpu.reg(5) as usize).min(all.len());
+                    let end = (start + len as usize).min(all.len());
+                    mem.write_slice(p, &all[start..end]);
+                    cpu.set_reg(0, p);
+                } else if x3 & 0x1000 != 0 {
+                    cpu.set_reg(0, p); // MAP_ANON
+                } else {
+                    cpu.set_reg(0, err); // MAP_FAILED
+                }
             }
             "_access" => {
                 let path = Objc::cstr(mem, x0).unwrap_or_default();
@@ -4286,6 +4313,25 @@ impl<'a> Hle<'a> {
                     _ => 0.0,
                 };
                 cpu.set_f64(0, r);
+            }
+            Kind::Strstr => {
+                let hay = mem.read_c_bytes(x0, 1 << 24).unwrap_or_default();
+                let needle = mem.read_c_bytes(x1, 1 << 20).unwrap_or_default();
+                let found = if needle.is_empty() {
+                    Some(0)
+                } else {
+                    hay.windows(needle.len()).position(|w| w == needle.as_slice())
+                };
+                cpu.set_reg(0, found.map_or(0, |i| x0 + i as u64));
+            }
+            Kind::MemsetPattern16 => {
+                // memset_pattern16(dst, pattern[16], len)
+                let pat = mem.read_bytes(x1, 16).map(|b| b.to_vec()).unwrap_or_default();
+                if pat.len() == 16 {
+                    let n = x2.min(1 << 28) as usize;
+                    let out: Vec<u8> = (0..n).map(|i| pat[i % 16]).collect();
+                    mem.write_slice(x0, &out);
+                }
             }
             Kind::Stdio => {
                 let n = name.clone();
